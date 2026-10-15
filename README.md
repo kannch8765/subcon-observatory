@@ -21,6 +21,8 @@ It answers ops questions like "are batches failing?", "how long do whispers take
 | `backlog` | Claude-P session state + transcripts | backlog (cursor vs. transcript length per session) |
 | `recall_log` | recall runtime logs | recall_events (whitelisted event templates) |
 | `deploy` | Subcon git checkouts | heads, reflog (sha, time, action verb) |
+| `letta` | Letta Postgres (read-only transactions) | steps (+ metrics), runs (+ metrics), messages (role, tool, sizes, ids-per-tool-return), blocks, block_history |
+| `letta_traces` | Letta `provider_traces` (opt-in, can be GBs) | traces (usage, finish reason, message mix per LLM call), tool_calls (argument shapes + whitelisted enum options) |
 
 ## Usage
 
@@ -30,12 +32,12 @@ uv sync
 uv run pytest                              # secret-leak tests
 uv run python -m observatory.export        # -> $SNAPSHOT_ROOT/<UTC timestamp>/<exporter>/*.csv
 uv run python -m observatory.export --only store,backlog
+uv run python -m observatory.export --only letta_traces --since 2026-10-01   # bound the big one
 ```
 
 Each snapshot has a `snapshot.json` (row and redaction counts per table, plus the observatory commit) and one directory per exporter.
 
 ## Roadmap
 
-- Letta Postgres exporters (step metrics, tool-call shapes, core-memory block history)
 - `analyze/`: standard metrics and charts, plus a diff against the previous snapshot
 - Swap the SSH export for a dedicated telemetry store once it exists

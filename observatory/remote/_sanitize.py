@@ -8,9 +8,9 @@ import csv, datetime, hashlib, io, json, os, re, sys, tarfile, time
 
 CONFIG = globals().get("CONFIG", {})
 
-_TS = re.compile(r"^\d{4}-\d{2}-\d{2}([T ]\d{2}:\d{2}(:\d{2}(\.\d+)?)?)?(Z|[+-]\d{2}:?\d{2})?$")
+_TS = re.compile(r"^\d{4}-\d{2}-\d{2}([T ]\d{2}:\d{2}(:\d{2}(\.\d+)?)?)?(Z|[+-]\d{2}(:?\d{2})?)?$")
 _ENUM = re.compile(r"^[a-z0-9_.:-]{1,48}$")
-_IDENT = re.compile(r"^[A-Za-z0-9_.:-]{1,96}$")  # tool names: `Bash`, `mcp__server__tool`; never whitespace
+_IDENT = re.compile(r"^[A-Za-z0-9_.:/-]{1,96}$")  # tool/model/error names: `Bash`, `mcp__a__b`, `org/Model-1`; never whitespace
 _KEY = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,47}$")
 REDACTED = "<redacted>"
 
@@ -27,7 +27,8 @@ def _length(value):
 
 
 class Table:
-    """CSV table whose columns are (name, type). Types: hash, int, float, ts, enum, ident, len, shape, bool."""
+    """CSV table whose columns are (name, type).
+    Types: hash, int, float, ts, enum, ident, idents (list -> `a>b`), len, shape, opts, bool."""
 
     def __init__(self, name, columns):
         self.name, self.columns = name, columns
@@ -45,6 +46,8 @@ class Table:
         if kind == "len":
             return _length(value)
         if kind == "bool":
+            if isinstance(value, str):  # Postgres CSV booleans
+                value = value.lower() in ("t", "true", "1")
             return int(bool(value))
         if kind in ("int", "float"):
             if isinstance(value, bool):
@@ -64,10 +67,23 @@ class Table:
         elif kind == "ident":
             if isinstance(value, str) and _IDENT.match(value):
                 return value
+        elif kind == "idents":
+            if isinstance(value, list) and all(isinstance(v, str) and _IDENT.match(v) for v in value):
+                return ">".join(value)
         elif kind == "shape":
             # {key: length}; keys must look like identifiers, values are never exported
             if isinstance(value, dict) and all(isinstance(k, str) and _KEY.match(k) for k in value):
                 return json.dumps({k: _length(v) for k, v in value.items()}, sort_keys=True)
+        elif kind == "opts":
+            # {key: option}; options must be numbers, booleans, enums or lists of enums
+            def ok(v):
+                if isinstance(v, (bool, int, float)):
+                    return True
+                if isinstance(v, str):
+                    return bool(_ENUM.match(v))
+                return isinstance(v, list) and all(isinstance(x, str) and _ENUM.match(x) for x in v)
+            if isinstance(value, dict) and all(isinstance(k, str) and _KEY.match(k) and ok(v) for k, v in value.items()):
+                return json.dumps(value, sort_keys=True)
         else:
             raise ValueError(f"unknown column type {kind!r}")
         self.redacted += 1
