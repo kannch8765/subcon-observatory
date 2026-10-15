@@ -3,6 +3,7 @@
     uv run python -m observatory.export                 # all exporters except letta_traces, via SSH_HOST
     uv run python -m observatory.export --only store    # a subset (letta_traces is opt-in: GBs of payloads)
     uv run python -m observatory.export --local         # run on this machine (tests / dry runs)
+    uv run python -m observatory.export --only opencode # downloaded opencode request-log CSVs (always local)
 """
 import argparse, datetime, io, json, pathlib, subprocess, sys, tarfile
 
@@ -17,8 +18,14 @@ EXPORTERS = {
     "deploy": (["DEPLOY_GIT_GLOBS"], []),
     "letta": (LETTA_CONFIG, ["_letta"]),
     "letta_traces": (LETTA_CONFIG, ["_letta"]),
+    "opencode": (["OPENCODE_CSV_GLOBS"], []),
 }
-DEFAULT_EXPORTERS = [name for name in EXPORTERS if name != "letta_traces"]  # traces are GBs: opt in with --only
+LOCAL_EXPORTERS = {"opencode"}  # inputs live on this machine, not the server
+
+
+def default_exporters(config):
+    """Everything except letta_traces (GBs: opt in with --only), and opencode only when configured."""
+    return [name for name in EXPORTERS if name != "letta_traces" and (name != "opencode" or config.get("OPENCODE_CSV_GLOBS"))]
 
 
 def load_config(path):
@@ -40,7 +47,7 @@ def build_script(name, config):
 
 
 def run_exporter(name, config, local=False):
-    cmd = [sys.executable, "-I", "-"] if local else ["ssh", config["SSH_HOST"], "python3", "-I", "-"]
+    cmd = [sys.executable, "-I", "-"] if local or name in LOCAL_EXPORTERS else ["ssh", config["SSH_HOST"], "python3", "-I", "-"]
     proc = subprocess.run(cmd, input=build_script(name, config).encode(), capture_output=True)
     sys.stderr.write(proc.stderr.decode(errors="replace"))
     if proc.returncode != 0:
@@ -58,7 +65,7 @@ def export(config, only=None, local=False, snapshot_dir=None):
     snap = pathlib.Path(snapshot_dir or pathlib.Path(config["SNAPSHOT_ROOT"]).expanduser() / stamp)
     snap.mkdir(parents=True, exist_ok=False)
     summary = {"snapshot": snap.name, "observatory_sha": git_sha(), "exporters": {}}
-    for name in only or DEFAULT_EXPORTERS:
+    for name in only or default_exporters(config):
         print(f"[{name}]", file=sys.stderr)
         try:
             data = run_exporter(name, config, local)

@@ -4,7 +4,11 @@ import csv, json, os, pathlib, subprocess
 
 import pytest
 
-from observatory.export import EXPORTERS, export
+import hashlib
+
+from observatory.export import EXPORTERS, default_exporters, export
+
+h = lambda value: hashlib.sha256(value.encode()).hexdigest()[:12]
 
 FAKE_PSQL = pathlib.Path(__file__).parent / "fake_psql.py"
 ALL = list(EXPORTERS)
@@ -92,10 +96,29 @@ def deployment(tmp_path):
                              "call_type": "agent_step", "req": '{"broken": "\\ud800 ' + SECRET, "resp": ""}],
     }
     (tmp_path / "letta.json").write_text(json.dumps(fixtures, ensure_ascii=False))
+
+    downloads = tmp_path / "downloads"
+    downloads.mkdir()
+    header = ["id", "requestID", "startedAt", "finishedAt", "durationMs", "outcome", "category", "protocol", "product", "stream",
+              "sessionID", "userAgent", "serviceAPIKeyID", "requestedModel", "model", "provider", "statusCode", "errorCode",
+              "errorMessage", "finish", "timeToFirstTokenMs", "inputTokens", "outputTokens", "reasoningEffort", "reasoningTokens",
+              "cacheReadTokens", "cacheWriteTokens", "cacheWrite1hTokens", "cost", "providerCost", "city", "requestHeaders",
+              "metadata", "attemptCount"]
+    ok = ["req-1", "req-1", "1792069307706", "1792069319066", "11360", "succeeded", "inference", "openai-chat", "go", "false",
+          "conv-1", SECRET, "key_" + SECRET, "deepseek-v4.1-flash", "deepseek-v4.1-flash", "opencode", "200", "", "", "", "9558",
+          "10803", "399", "", "316", "230784", "0", "", "0.0025522", "", "Kohaku said hello",
+          json.dumps({"x-opencode-session": SECRET, "messages": [SECRET]}), json.dumps({"note": "my private feeling"}), "1"]
+    failed = ["req-2", "req-2", "1792069400000", "1792069401000", "1000", "failed", "inference", "openai-chat", "go", "false",
+              "conv-1", "", "", "deepseek-v4.1-flash", "deepseek-v4.1-flash", "opencode", "400", "inference_failed",
+              f"upstream said: {SECRET}", "", "", "0", "0", "", "", "0", "0", "", "0", "", "", "", "", "1"]
+    for name, rows in (("request-logs-a.csv", [ok, failed]), ("request-logs-b.csv", [failed])):  # overlapping downloads
+        with open(downloads / name, "w", newline="") as f:
+            csv.writer(f, quoting=csv.QUOTE_ALL).writerows([header, *rows])
     return {
         "STORE_DIR": str(store), "WHISPER_DIRS": str(whispers), "CLAUDE_HOME": str(home),
         "RECALL_LOG_GLOBS": str(log.parent / "*.log"), "DEPLOY_GIT_GLOBS": str(tmp_path / "checkouts" / "*"),
         "LETTA_PSQL": str(FAKE_PSQL), "LETTA_PG_ARGS": str(tmp_path / "letta.json"),
+        "OPENCODE_CSV_GLOBS": str(downloads / "request-logs-*.csv"),
     }
 
 
@@ -159,3 +182,19 @@ def test_letta_structure(deployment, tmp_path):
     for name in ("letta", "letta_traces"):
         tables = json.loads((snap / name / "manifest.json").read_text())["tables"]
         assert all(t["redacted_cells"] == 0 for t in tables.values()), tables
+
+
+def test_opencode_structure(deployment, tmp_path):
+    snap = export({**deployment, "SSH_HOST": "unreachable.invalid"}, ["opencode"], snapshot_dir=tmp_path / "snap")  # local despite SSH
+    ok, failed = read(snap / "opencode" / "requests.csv")  # the duplicate row from the second download is gone
+    assert (ok["model"], ok["outcome"], ok["stream"]) == ("deepseek-v4.1-flash", "succeeded", "0")
+    assert (ok["input_tokens"], ok["cache_read_tokens"], ok["ttft_ms"], ok["cost"]) == ("10803", "230784", "9558", "0.0025522")
+    assert ok["started_at"] == "2026-10-15T13:01:47.706000+00:00" and ok["conversation"] == h("conv-1")  # joins to letta runs.conversation
+    assert (failed["status_code"], failed["error_code"]) == ("400", "inference_failed")
+    manifest = json.loads((snap / "opencode" / "manifest.json").read_text())
+    assert manifest["tables"]["requests"] == {"rows": 2, "redacted_cells": 0} and manifest["notes"]["files"] == 2
+
+
+def test_opencode_runs_by_default_only_when_configured():
+    assert "opencode" in default_exporters({"OPENCODE_CSV_GLOBS": "x"})
+    assert "opencode" not in default_exporters({}) and "letta_traces" not in default_exporters({})

@@ -23,6 +23,7 @@ It answers ops questions like "are batches failing?", "how long do whispers take
 | `deploy` | Subcon git checkouts | heads, reflog (sha, time, action verb) |
 | `letta` | Letta Postgres (read-only transactions) | steps (+ metrics), runs (+ metrics), messages (role, tool, sizes, ids-per-tool-return), blocks, block_history |
 | `letta_traces` | Letta `provider_traces` (opt-in, can be GBs) | traces (usage, finish reason, message mix per LLM call), tool_calls (argument shapes + whitelisted enum options) |
+| `opencode` | opencode gateway request-log CSVs downloaded from the console (read locally; there is no request-log API) | requests (timing, status/error code, tokens incl. cache read/write, cost; `conversation` joins to letta runs) |
 
 ## Usage
 
@@ -33,6 +34,7 @@ uv run pytest                              # secret-leak tests
 uv run python -m observatory.export        # -> $SNAPSHOT_ROOT/<UTC timestamp>/<exporter>/*.csv
 uv run python -m observatory.export --only store,backlog
 uv run python -m observatory.export --only letta_traces --since 2026-10-01   # bound the big one
+uv run python -m observatory.export --only opencode    # after downloading request logs from the opencode console
 ```
 
 Each snapshot has a `snapshot.json` (row and redaction counts per table, plus the observatory commit) and one directory per exporter.
