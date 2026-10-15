@@ -37,6 +37,18 @@ uv run python -m observatory.export --only letta_traces --since 2026-10-01   # b
 uv run python -m observatory.export --only opencode    # after downloading request logs from the opencode console
 ```
 
+### On the server: telemetry store + health
+
+`observatory.collect` runs the same exporters locally on the server (no SSH), merges their sanitized CSVs into a SQLite
+`telemetry.db`, recomputes a long-format `daily_rollup`, and writes `health.json` (ok / warn / alert per check) and
+`digest.json`. It writes only `TELEMETRY_DIR`. Design and unit hardening: [docs/TELEMETRY-SLICE-1.md](docs/TELEMETRY-SLICE-1.md).
+
+```
+python3 -E -s -m observatory.collect --config <file> --plan                 # what it would do; writes nothing
+python3 -E -s -m observatory.collect --config <file> --since 2026-08-01     # first run / backfill (incl. letta_traces)
+python3 -E -s -m observatory.collect --config <file>                        # hourly, incremental
+```
+
 Each snapshot has a `snapshot.json` (row and redaction counts per table, plus the observatory commit) and one directory per exporter.
 
 ## Roadmap

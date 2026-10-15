@@ -14,10 +14,10 @@ for r in read_jsonl(P("memories.jsonl")):
                  r.get("summary"), payload, r.get("participants"), r.get("linked_memory_ids"))
 
 batches = Table("batches", [("batch_prefix", "enum"), ("bid", "hash"), ("attempt", "hash"), ("status", "enum"), ("detail", "enum"),
-                            ("created_at", "ts"), ("finalized_at", "ts")])
+                            ("created_at", "ts"), ("finalized_at", "ts"), ("retry_reasons", "idents")])
 for r in read_jsonl(P("batches.jsonl")):
     batches.add(prefix(r.get("batch_id")), r.get("batch_id"), r.get("attempt_id"), r.get("status"), r.get("detail"),
-                r.get("created_at"), r.get("finalized_at"))
+                r.get("created_at"), r.get("finalized_at"), r.get("retry_reasons"))
 
 outcome_cols = [("mid", "hash"), ("batch_prefix", "enum"), ("bid", "hash"), ("attempt", "hash"), ("outcome", "enum"),
                 ("rejection_code", "enum"), ("recorded_at", "ts")]
