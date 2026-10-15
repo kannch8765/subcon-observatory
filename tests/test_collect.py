@@ -1,5 +1,5 @@
 """Collector end to end against the fake deployment from test_export: ingest, idempotence, rollup, health, no leaks."""
-import csv, datetime, json, sqlite3
+import csv, datetime, json, sqlite3, sys
 
 from observatory import collect, health, telemetry
 from tests.test_export import SECRETS, deployment  # noqa: F401  (fixture)
@@ -53,8 +53,10 @@ def test_collect_end_to_end(deployment, tmp_path):
 
 def test_plan_never_reads_all_traces_without_since(deployment, tmp_path):
     config = config_for(deployment, tmp_path)
-    names = [name for name, _ in collect.plan(config, None)]
+    empty = telemetry.connect(tmp_path / "empty.db")
+    names = [name for name, _ in collect.plan(config, None, empty)]
     assert "letta_traces" not in names and "opencode" in names
+    assert ("letta", None) in collect.plan(config, None, empty)  # nothing ingested yet: full (small) Letta metadata
     assert ("letta_traces", "2026-08-01") in collect.plan(config, "2026-08-01")
     assert ("letta", "2026-08-01") in collect.plan(config, "2026-08-01")
 
@@ -151,14 +153,17 @@ def test_shared_block_keeps_every_agent_link(tmp_path):
     assert health.values(db, NOW, [])["blocks_over_limit"] == 1
 
 
-def test_plan_does_not_touch_an_existing_database(deployment, tmp_path):
+def test_plan_does_not_touch_an_existing_database(deployment, tmp_path, monkeypatch):
     config = config_for(deployment, tmp_path)
+    env = tmp_path / "collect.env"
+    env.write_text("".join(f"{k}={v}\n" for k, v in config.items()))
     assert collect.run(config, since="2026-10-01", now=NOW)[0]
     tdir = tmp_path / "telemetry"
-    db = sqlite3.connect(tdir / "telemetry.db")
-    db.execute("pragma journal_mode=delete")  # so a stray write-mode connect would visibly flip it back to wal
-    db.close()
-    before = {p.name: p.read_bytes() for p in tdir.iterdir() if p.is_file()}
-    collect.plan(config, None)
-    after = {p.name: p.read_bytes() for p in tdir.iterdir() if p.is_file()}
-    assert after == before
+    # Keep the collector's normal WAL mode: even a read-only open would add -wal / -shm sidecars here
+    assert sqlite3.connect(tdir / "telemetry.db").execute("pragma journal_mode").fetchone()[0] == "wal"
+    before = {p.name: p.read_bytes() for p in tdir.iterdir()}
+    steps = dict(collect.plan(config, None))
+    monkeypatch.setattr(sys, "argv", ["collect", "--config", str(env), "--plan"])
+    collect.main()
+    after = {p.name: p.read_bytes() for p in tdir.iterdir()}
+    assert after == before and steps["letta"].startswith("<newest")

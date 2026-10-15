@@ -17,21 +17,21 @@ ALWAYS = ["store", "whispers", "backlog", "recall_log", "deploy", "letta"]
 ROLLUP_DAYS = 3
 
 
-def plan(config, since):
-    """Exporters to run, each with the LETTA_SINCE it gets (None = full history)."""
-    tdir = pathlib.Path(config["TELEMETRY_DIR"])
-    db_path = tdir / "telemetry.db"
-    latest = {}
-    if db_path.exists():
-        db = telemetry.connect_readonly(db_path)
-        latest = {"letta": telemetry.max_value(db, "letta_steps", "created_at"),
-                  "letta_traces": telemetry.max_value(db, "letta_traces", "created_at")}
-        db.close()
-    steps = []
-    for name in ALWAYS:
-        steps.append((name, (since or telemetry.since_day(latest.get("letta"))) if name == "letta" else None))
+def plan(config, since, db=None):
+    """Exporters to run, each with the LETTA_SINCE it gets (None = full history).
+
+    With `db` (the run's own connection) the incremental watermark is resolved. Without it, as for `--plan`, the rule
+    is described instead: even a read-only open of a WAL database creates -wal/-shm files, and --plan writes nothing."""
+    def bound(table):
+        if since:
+            return since
+        if db is None:
+            return f"<newest {table}.created_at - 1 day>"
+        return telemetry.since_day(telemetry.max_value(db, table, "created_at"))
+
+    steps = [(name, bound("letta_steps") if name == "letta" else None) for name in ALWAYS]
     if config.get("COLLECT_TRACES", "1") != "0":
-        traces_since = since or telemetry.since_day(latest.get("letta_traces"))
+        traces_since = bound("letta_traces")
         if traces_since:  # never an unbounded provider_traces read: the first one needs --since
             steps.append(("letta_traces", traces_since))
     if config.get("OPENCODE_CSV_GLOBS"):
@@ -53,9 +53,9 @@ def run(config, since=None, now=None):
     tdir.mkdir(parents=True, exist_ok=True)
     with open(tdir / "collect.lock", "w") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)  # an overlapping run fails fast instead of piling up
-        steps = plan(config, since)
         started = now.isoformat()
         db = telemetry.connect(tdir / "telemetry.db")
+        steps = plan(config, since, db)
         counts, redacted, errors, ok = {}, {}, {}, False
         work = tdir / "work"
         shutil.rmtree(work, ignore_errors=True)
@@ -110,7 +110,8 @@ def main():
     if args.plan:
         print(f"TELEMETRY_DIR={config['TELEMETRY_DIR']}")
         for name, letta_since in plan(config, args.since):
-            print(f"EXPORT {name}" + (f" since={letta_since}" if name.startswith("letta") else ""))
+            note = " (skipped until a --since backfill has ingested traces)" if name == "letta_traces" and not args.since else ""
+            print(f"EXPORT {name}" + (f" since={letta_since}{note}" if name.startswith("letta") else ""))
         print("RESULT=PLAN_OK")
         return
     ok, counts, errors = run(config, args.since)

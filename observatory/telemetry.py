@@ -104,11 +104,6 @@ def ingest_snapshot(db, snap, sampled_at):
     return counts
 
 
-def connect_readonly(path):
-    """For planning: no journal-mode change, no table creation, no write of any kind."""
-    return sqlite3.connect(f"file:{pathlib.Path(path).resolve()}?mode=ro", uri=True)
-
-
 def max_value(db, table, column):
     try:
         return db.execute(f'select max("{column}") from "{table}"').fetchone()[0]
