@@ -31,7 +31,38 @@ MEMORY_ID = re.compile(r"memory_id[^A-Za-z0-9]+([A-Za-z0-9_-]{8,})")
 SNIPPET_ID = re.compile(r"snippet_id[^A-Za-z0-9]+([A-Za-z0-9_-]{4,})")
 messages = Table("messages", [("message", "hash"), ("created_at", "ts"), ("agent", "hash"), ("conversation", "hash"), ("run", "hash"),
                               ("step", "hash"), ("role", "enum"), ("name", "ident"), ("content_chars", "int"), ("tool_calls", "idents"),
-                              ("is_err", "bool"), ("sequence_id", "int"), ("n_memory_ids", "int"), ("n_snippet_ids", "int")])
+                              ("is_err", "bool"), ("sequence_id", "int"), ("n_memory_ids", "int"), ("n_snippet_ids", "int"),
+                              ("tool_status", "idents"), ("tool_error", "idents")])
+
+# Fixed error messages thrown by Subcon's client tools, exported as template names. Anything else is `other`.
+# Letta wraps them in a JSON `func_response`, so they are searched for, not anchored.
+TOOL_ERROR_TEMPLATES = [
+    ("whisper_called_twice", re.compile(r"deliver_whisper may be called at most once per batch")),
+    ("whisper_not_surfaced", re.compile(r"deliver_whisper may select only one memory and quote snippets surfaced by a prior")),
+    ("whisper_bad_args", re.compile(r"deliver_whisper requires one searched memory_id and 1-3 unique snippet_ids")),
+    ("whisper_no_summary", re.compile(r"historical memory whisper requires a surfaced canonical summary")),
+    ("maintenance_unseen_ids", re.compile(r"\w+ may reference only memory_ids returned by a prior purpose=maintenance memory_search")),
+    ("intent_mismatch", re.compile(r"Trusted assistant intent payload/store mismatch")),
+]
+
+
+def tool_returns(body):
+    """(`status` of each tool return, error template of each failed one). Client-tool approvals report errors
+    here, not in is_err. Error text never leaves: it's only matched against TOOL_ERROR_TEMPLATES."""
+    try:
+        value = json.loads(body)
+    except ValueError:
+        return None, None
+    items = [item for item in (value if isinstance(value, list) else [value]) if isinstance(item, dict)]
+    statuses = [item["status"] for item in items if isinstance(item.get("status"), str)]
+    errors = []
+    for item in items:
+        if item.get("status") == "error":
+            text = next((item[k] for k in ("func_response", "tool_return") if isinstance(item.get(k), str)), "")
+            errors.append(next((name for name, rx in TOOL_ERROR_TEMPLATES if rx.search(text)), "other"))
+    return statuses or None, errors or None
+
+
 for r in psql_rows(f"""select id, created_at, agent_id, conversation_id, run_id, step_id, role, name,
         length(coalesce(text, content::text)) as content_chars,
         (select string_agg(tc->'function'->>'name', '>') from json_array_elements(
@@ -40,9 +71,11 @@ for r in psql_rows(f"""select id, created_at, agent_id, conversation_id, run_id,
         case when role in ('tool', 'approval') then coalesce(tool_returns::text, content::text) end as tool_body
     from messages {letta_since('created_at')} order by created_at"""):
     body = r["tool_body"] or ""
+    statuses, errors = tool_returns(body) if body else (None, None)
     messages.add(r["id"], r["created_at"], r["agent_id"], r["conversation_id"], r["run_id"], r["step_id"], r["role"], r["name"],
                  r["content_chars"], r["tool_calls"].split(">") if r["tool_calls"] else None, r["is_err"], r["sequence_id"],
-                 len(set(MEMORY_ID.findall(body))) if body else None, len(set(SNIPPET_ID.findall(body))) if body else None)
+                 len(set(MEMORY_ID.findall(body))) if body else None, len(set(SNIPPET_ID.findall(body))) if body else None,
+                 statuses, errors)
 
 blocks = Table("blocks", [("block", "hash"), ("agent", "hash"), ("label", "ident"), ("chars", "int"), ("limit", "int"),
                           ("created_at", "ts"), ("updated_at", "ts")])

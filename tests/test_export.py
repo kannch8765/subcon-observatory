@@ -76,7 +76,12 @@ def deployment(tmp_path):
         "messages": [{"id": "message-1", "created_at": ts, "agent_id": "agent-1", "conversation_id": "conv-1", "run_id": "run-1",
                       "step_id": "step-1", "role": "tool", "name": "memory_search", "content_chars": "120", "tool_calls": "",
                       "is_err": "f", "sequence_id": "7",
-                      "tool_body": f'{{"memory_id": "mem_abcdef12", "summary": "{SECRET}", "snippet_id": "s123"}}'}],
+                      "tool_body": json.dumps([{"status": "error", "tool_return": f"memory_id: mem_abcdef12 {SECRET} snippet_id: s123"},
+                                               {"status": "error", "tool_call_id": "c1", "stdout": None, "stderr": None,
+                                                "func_response": json.dumps({"status": "Failed", "message": "Error: deliver_whisper "
+                                                    "may select only one memory and quote snippets surfaced by a prior foreground_recall "
+                                                    f"memory_search in this turn ({SECRET})"}, ensure_ascii=False)},
+                                               {"status": "success", "tool_return": "Kohaku said hello"}], ensure_ascii=False)}],
         "block": [{"id": "block-1", "agent_id": "agent-1", "label": "persona", "chars": "2048", "limit": "5000",
                    "created_at": ts, "updated_at": ts}],
         "block_history": [{"block_id": "block-1", "sequence_number": "1", "chars": "1900", "actor_type": "letta_agent", "created_at": ts}],
@@ -140,6 +145,8 @@ def test_letta_structure(deployment, tmp_path):
     assert run["tools_used"] == "memory_search>send_message" and run["background"] == "0" and run["total_ms"] == "33000"
     message = read(snap / "letta" / "messages.csv")[0]
     assert (message["n_memory_ids"], message["n_snippet_ids"], message["is_err"]) == ("1", "1", "0")
+    assert message["tool_status"] == "error>error>success"
+    assert message["tool_error"] == "other>whisper_not_surfaced"
     assert read(snap / "letta" / "blocks.csv")[0]["label"] == "persona"
     assert read(snap / "letta" / "block_history.csv")[0]["actor_type"] == "letta_agent"
     trace, broken = read(snap / "letta_traces" / "traces.csv")
