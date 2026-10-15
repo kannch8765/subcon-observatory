@@ -1,0 +1,13 @@
+[project]
+name = "subcon-observatory"
+version = "0.1.0"
+description = "Read-only, sanitized observability exports and analysis for a Subcon / Letta deployment"
+requires-python = ">=3.12"
+dependencies = []
+
+[dependency-groups]
+dev = ["pytest>=8"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]

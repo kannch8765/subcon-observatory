@@ -1,0 +1,9 @@
+config.local.env
+snapshots/
+*.csv
+*.csv.gz
+*.tar.gz
+out/
+.venv/
+__pycache__/
+.pytest_cache/
