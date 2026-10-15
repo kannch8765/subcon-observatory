@@ -13,7 +13,7 @@ TABLES = {
     "letta/steps": ("letta_steps", "upsert", ["step"], []),
     "letta/runs": ("letta_runs", "upsert", ["run"], []),
     "letta/messages": ("letta_messages", "upsert", ["message"], []),
-    "letta/blocks": ("letta_blocks", "upsert", ["block"], []),
+    "letta/blocks": ("letta_blocks", "upsert", ["block", "agent"], []),  # one row per block x agent link
     "letta/block_history": ("letta_block_history", "log", [], []),
     "letta_traces/traces": ("letta_traces", "upsert", ["trace"], []),
     "letta_traces/tool_calls": ("letta_tool_calls", "upsert", ["trace", "ord"], []),
@@ -102,6 +102,11 @@ def ingest_snapshot(db, snap, sampled_at):
         if name in TABLES:
             counts[name] = ingest_csv(db, name, path, sampled_at)
     return counts
+
+
+def connect_readonly(path):
+    """For planning: no journal-mode change, no table creation, no write of any kind."""
+    return sqlite3.connect(f"file:{pathlib.Path(path).resolve()}?mode=ro", uri=True)
 
 
 def max_value(db, table, column):

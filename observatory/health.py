@@ -15,8 +15,12 @@ THRESHOLDS = {
     "letta_failed_step_share_24h": (0.05, 0.20),
     "disk_used_share": (0.80, 0.90),
     "blocks_over_limit": (1, None),
+    # A run whose exporters failed must never look green, and repeated partial failures must age out
+    "collector_failed_exporters": (None, 1),
+    "collector_last_success_age_h": (2, 26),
 }
 STUCK_GAP_LINES = 50
+NONE_IS_ALERT = {"collector_last_success_age_h"}  # "never succeeded" is the worst case, not "no data"
 
 
 def thresholds(config):
@@ -95,14 +99,19 @@ def values(db, now, disk_paths):
     return out
 
 
-def check(db, now, config):
+def check(db, now, config, collector_errors=(), last_success_at=None):
     disk_paths = [p for p in (config.get("DISK_PATHS") or "/").split(",") if p]
     measured = values(db, now, disk_paths)
+    measured["collector_failed_exporters"] = len(collector_errors)
+    last_ok = parse_ts(last_success_at)
+    measured["collector_last_success_age_h"] = (now - last_ok).total_seconds() / 3600 if last_ok else None
     checks = []
     for name, (warn, alert) in thresholds(config).items():
         value = measured.get(name)
-        checks.append({"name": name, "level": level(value, warn, alert), "value": round(value, 4) if isinstance(value, float) else value,
+        lvl = "alert" if value is None and name in NONE_IS_ALERT else level(value, warn, alert)
+        checks.append({"name": name, "level": lvl, "value": round(value, 4) if isinstance(value, float) else value,
                        "warn": warn, "alert": alert})
     overall = max((c["level"] for c in checks), key=LEVELS.index, default="ok")
-    return {"schema": "subcon_health_v1", "generated_at": now.isoformat(), "overall": overall, "checks": checks,
+    return {"schema": "subcon_health_v1", "generated_at": now.isoformat(), "last_success_at": last_success_at,
+            "overall": overall, "checks": checks,
             "info": {"unresolved_intents": measured["unresolved_intents"]}}

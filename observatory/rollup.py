@@ -154,6 +154,13 @@ def recent_days(now, tz, n):
     return [(today - datetime.timedelta(days=i)).isoformat() for i in range(n)]
 
 
+def days_since(now, tz, since):
+    """Every local day from `since` (ISO date) through today, newest first."""
+    first = datetime.date.fromisoformat(since[:10])
+    today = now.astimezone(tz).date()
+    return [(today - datetime.timedelta(days=i)).isoformat() for i in range((today - first).days + 1)]
+
+
 def write(db, tz, days):
     metrics = compute(db, tz, days)
     db.execute(f"delete from daily_rollup where day in ({', '.join('?' for _ in days)})", days)

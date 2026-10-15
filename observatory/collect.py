@@ -23,7 +23,7 @@ def plan(config, since):
     db_path = tdir / "telemetry.db"
     latest = {}
     if db_path.exists():
-        db = telemetry.connect(db_path)
+        db = telemetry.connect_readonly(db_path)
         latest = {"letta": telemetry.max_value(db, "letta_steps", "created_at"),
                   "letta_traces": telemetry.max_value(db, "letta_traces", "created_at")}
         db.close()
@@ -70,13 +70,17 @@ def run(config, since=None, now=None):
                 redacted.update({f"{name}/{t}": v["redacted_cells"] for t, v in summary.items() if v["redacted_cells"]})
                 counts.update(telemetry.ingest_snapshot(db, snap, started))
                 db.commit()
-            days = rollup.recent_days(now, tz, ROLLUP_DAYS)
+            # A backfill recomputes every day it may have touched, not just the latest few
+            days = rollup.days_since(now, tz, since) if since else rollup.recent_days(now, tz, ROLLUP_DAYS)
             rollup.write(db, tz, days)
             db.commit()
-            report = health.check(db, now, config)
+            last_ok = db.execute("select max(started_at) from collect_runs where ok = 1").fetchone()[0]
+            report = health.check(db, now, config, collector_errors=sorted(errors),
+                                  last_success_at=started if not errors else last_ok)
             report["collector"] = {"errors": sorted(errors), "redacted_cells": sum(redacted.values())}
             atomic_json(tdir / "health.json", report)
-            atomic_json(tdir / "digest.json", {**rollup.digest(db, days[1]), "generated_at": started, "overall": report["overall"]})
+            yesterday = rollup.recent_days(now, tz, 2)[1]
+            atomic_json(tdir / "digest.json", {**rollup.digest(db, yesterday), "generated_at": started, "overall": report["overall"]})
             ok = not errors
         except Exception as error:
             errors["collect"] = f"{type(error).__name__}: {error}"

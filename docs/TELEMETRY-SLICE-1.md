@@ -80,8 +80,12 @@ Implemented in `observatory/health.py`; tested in `tests/test_collect.py`.
 | disk used on the Letta / telemetry volume | > 80 % | > 90 % |
 | Letta block over its char limit (agents active in 24 h only) | any | — |
 
-The collector can't report its own death, so staleness is checked by the reader:
-the bot alerts once if `health.json` is older than 2 h.
+| collector: any exporter failed in this run | — | any |
+| collector: age of the last fully successful run (`last_success_at`) | > 2 h | > 26 h, or never |
+
+A run with failed exporters still writes a fresh `health.json`, but it can never be green, and repeated partial
+failures age out through `last_success_at`. The collector can't report its own death, so the bot also alerts once if
+`health.json` itself is older than 2 h.
 
 Thresholds live in config so they can be tuned without a release.
 
@@ -152,7 +156,8 @@ runtime's PrivateTmp, so every restart wipes them.
    snapshots: per-day cost ($1.47 / $2.15 / $2.00), cache-hit share (88–91 %), backlog (21,202 lines) and the
    10-11 / 10-12 retry spike (73 % / 87 % retryable) match the hand analysis.
 2. **Owner approves the server plan** (unit, paths, pinned commit). `--plan` prints what it would read/write.
-3. One-time backfill: `LETTA_SINCE=2026-08-01`, including `letta_traces` (expected minutes, at idle priority).
+3. One-time backfill: `--since 2026-08-01`, including `letta_traces` (expected minutes, at idle priority). A run with
+   `--since` recomputes the rollup for every day from that date, not just the latest three.
 4. Enable the hourly timer. Compare the first rollup days against today's hand analysis
    (e.g. 10-12..10-15 cost $1.90/day, cache-hit share 89.6 %).
 5. After ~1 week green: trace retention gets its own plan (keep raw N days, `VACUUM`), with owner approval.

@@ -102,3 +102,63 @@ def test_rollup_survives_a_column_an_older_snapshot_lacks(tmp_path):
     telemetry.ingest_csv(db, "store/batches", tmp_path / "b.csv", "s1")  # no retry_reasons column at all
     metrics = rollup.compute(db, zoneinfo.ZoneInfo("Asia/Tokyo"), ["2026-10-15"])
     assert metrics[("2026-10-15", "all")]["retryable"] == 1
+
+
+def failing_export(config, only, local=False, snapshot_dir=None):
+    snapshot_dir.mkdir(parents=True)
+    (snapshot_dir / "snapshot.json").write_text(json.dumps({"exporters": {only[0]: {"error": "exporter boom"}}}))
+    return snapshot_dir
+
+
+def test_failed_exporters_never_publish_green_health(deployment, tmp_path, monkeypatch):
+    config = config_for(deployment, tmp_path)
+    monkeypatch.setattr(collect, "export", failing_export)
+    ok, _, errors = collect.run(config, now=NOW)
+    assert not ok and set(errors) >= {"store", "letta"}
+    report = json.loads((tmp_path / "telemetry" / "health.json").read_text())
+    levels = {c["name"]: c["level"] for c in report["checks"]}
+    assert report["overall"] == "alert" and report["last_success_at"] is None
+    assert levels["collector_failed_exporters"] == "alert" and levels["collector_last_success_age_h"] == "alert"
+
+
+def test_partial_failures_age_out_the_last_success(deployment, tmp_path, monkeypatch):
+    config = config_for(deployment, tmp_path)
+    assert collect.run(config, since="2026-10-01", now=NOW)[0]
+    monkeypatch.setattr(collect, "export", failing_export)
+    collect.run(config, now=NOW + datetime.timedelta(hours=3))
+    report = json.loads((tmp_path / "telemetry" / "health.json").read_text())
+    age = next(c for c in report["checks"] if c["name"] == "collector_last_success_age_h")
+    assert report["last_success_at"] == NOW.isoformat() and age["level"] == "warn" and age["value"] == 3.0
+
+
+def test_backfill_recomputes_historical_days(deployment, tmp_path):
+    config = config_for(deployment, tmp_path)
+    later = NOW + datetime.timedelta(days=5)  # the fixture's 10-15 rows are now outside the default 3-day window
+    assert collect.run(config, since="2026-10-01", now=later)[0]
+    db = sqlite3.connect(tmp_path / "telemetry" / "telemetry.db")
+    day = dict(db.execute("select metric, value from daily_rollup where day = '2026-10-15' and scope = 'all'").fetchall())
+    assert day["attempts"] == 1 and day["steps"] == 1
+
+
+def test_shared_block_keeps_every_agent_link(tmp_path):
+    db = telemetry.connect(tmp_path / "t.db")
+    write_csv(tmp_path / "blocks.csv", [{"block": "blk", "agent": "active", "label": "persona", "chars": 6000, "limit": 5000},
+                                        {"block": "blk", "agent": "zz-old", "label": "persona", "chars": 6000, "limit": 9000}])
+    write_csv(tmp_path / "steps.csv", [{"step": "s1", "agent": "active", "status": "COMPLETED", "created_at": "2026-10-15T11:00:00+00:00"}])
+    telemetry.ingest_csv(db, "letta/blocks", tmp_path / "blocks.csv", "s1")
+    telemetry.ingest_csv(db, "letta/steps", tmp_path / "steps.csv", "s1")
+    assert count(db, "letta_blocks") == 2
+    assert health.values(db, NOW, [])["blocks_over_limit"] == 1
+
+
+def test_plan_does_not_touch_an_existing_database(deployment, tmp_path):
+    config = config_for(deployment, tmp_path)
+    assert collect.run(config, since="2026-10-01", now=NOW)[0]
+    tdir = tmp_path / "telemetry"
+    db = sqlite3.connect(tdir / "telemetry.db")
+    db.execute("pragma journal_mode=delete")  # so a stray write-mode connect would visibly flip it back to wal
+    db.close()
+    before = {p.name: p.read_bytes() for p in tdir.iterdir() if p.is_file()}
+    collect.plan(config, None)
+    after = {p.name: p.read_bytes() for p in tdir.iterdir() if p.is_file()}
+    assert after == before
