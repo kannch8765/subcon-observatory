@@ -28,7 +28,8 @@ def deployment(tmp_path):
     write_jsonl(store / "memories.jsonl", [{"memory_id": "m1", "kind": "preference", "status": "active", "created_at": "2026-10-01T00:00:00Z",
                                             "summary": SECRET, "payload": {"text": SECRET, "Kohaku said hello": 1}, "participants": ["a", "b"]}])
     write_jsonl(store / "batches.jsonl", [{"batch_id": "batch_abc", "attempt_id": "at1", "status": "retryable_failure",
-                                           "created_at": "2026-10-15T00:00:00Z", "finalized_at": "2026-10-15T00:01:00Z"}])
+                                           "created_at": "2026-10-15T00:00:00Z", "finalized_at": "2026-10-15T00:01:00Z",
+                                           "retry_reasons": ["turn_failed"]}])
     write_jsonl(store / "outcomes.jsonl", [{"memory_id": "m1", "batch_id": "batch_abc", "outcome": "rejected",
                                             "rejection_code": "Kohaku said hello", "reason": SECRET, "recorded_at": "2026-10-15T00:00:30Z"}])
     write_jsonl(store / "evidence.jsonl", [
@@ -144,6 +145,7 @@ def test_structure_survives_sanitizing(deployment, tmp_path):
     assert mem["payload_lens"] == "<redacted>"  # a key that isn't an identifier is itself treated as content
     batch = read(snap / "store" / "batches.csv")[0]
     assert batch["batch_prefix"] == "batch" and batch["status"] == "retryable_failure" and len(batch["attempt"]) == 12
+    assert batch["retry_reasons"] == "turn_failed"
     assert read(snap / "store" / "outcomes.csv")[0]["rejection_code"] == "<redacted>"
     assert [e["tool_name"] for e in read(snap / "store" / "evidence.csv")] == [
         "Bash", "mcp__kohaku-relationship-memory__memory_remember_with_feeling_v2", "<redacted>"]
