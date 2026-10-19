@@ -15,6 +15,7 @@ TABLES = {
     "letta/messages": ("letta_messages", "upsert", ["message"], []),
     "letta/blocks": ("letta_blocks", "upsert", ["block", "agent"], []),  # one row per block x agent link
     "letta/block_history": ("letta_block_history", "log", [], []),
+    "letta/table_sizes": ("letta_table_sizes", "sample", ["relation"], []),  # one row per table per run
     "letta_traces/traces": ("letta_traces", "upsert", ["trace"], []),
     "letta_traces/tool_calls": ("letta_tool_calls", "upsert", ["trace", "ord"], []),
     "store/memories": ("memories", "upsert", ["mid"], []),

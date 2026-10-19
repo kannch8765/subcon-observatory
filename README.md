@@ -49,9 +49,22 @@ python3 -E -s -m observatory.collect --config <file> --since 2026-08-01     # fi
 python3 -E -s -m observatory.collect --config <file>                        # hourly, incremental
 ```
 
+### Daily chart report
+
+Once a day (first collect run at or after `CHARTS_AFTER_HOUR`, default 06:00 local) the collector writes
+`TELEMETRY_DIR/charts/<yesterday>/report.html` (self-contained page: inline SVG, 30/90-day windows, healthcheck zones,
+deploy markers, a table per chart) and `metrics.json` (the numbers behind it). `charts/latest` points at the newest day;
+`CHARTS_KEEP_DAYS` (default 60) are kept. It reads only `daily_rollup` and deploy shas. A chart failure is logged in
+`collect_runs` but never fails the run. To render from a copy of the database:
+
+```
+uv run python -m observatory.charts --db telemetry.db --out out/charts --day 2026-10-18
+```
+
 Each snapshot has a `snapshot.json` (row and redaction counts per table, plus the observatory commit) and one directory per exporter.
 
 ## Roadmap
 
-- `analyze/`: standard metrics and charts, plus a diff against the previous snapshot
+- Weekly report delivery through the Subcon review bot
+- `provider_traces` retention (keep raw N days), driven by the `pg_bytes:*` size metrics
 - Swap the SSH export for a dedicated telemetry store once it exists

@@ -90,6 +90,8 @@ def deployment(tmp_path):
         "block": [{"id": "block-1", "agent_id": "agent-1", "label": "persona", "chars": "2048", "limit": "5000",
                    "created_at": ts, "updated_at": ts}],
         "block_history": [{"block_id": "block-1", "sequence_number": "1", "chars": "1900", "actor_type": "letta_agent", "created_at": ts}],
+        "pg_class": [{"relname": "provider_traces", "total_bytes": "5100000000", "row_estimate": "20590"},
+                     {"relname": "_database", "total_bytes": "5600000000", "row_estimate": ""}],
         "provider_traces": [{"id": "trace-1", "created_at": ts, "step_id": "step-1", "run_id": "run-1", "agent_id": "agent-1",
                              "call_type": "agent_step", "req": json.dumps(request, ensure_ascii=False),
                              "resp": json.dumps(response, ensure_ascii=False)},
@@ -174,6 +176,8 @@ def test_letta_structure(deployment, tmp_path):
     assert message["tool_error"] == "other>whisper_not_surfaced"
     assert read(snap / "letta" / "blocks.csv")[0]["label"] == "persona"
     assert read(snap / "letta" / "block_history.csv")[0]["actor_type"] == "letta_agent"
+    sizes = {r["relation"]: r["total_bytes"] for r in read(snap / "letta" / "table_sizes.csv")}
+    assert sizes == {"provider_traces": "5100000000", "_database": "5600000000"}
     trace, broken = read(snap / "letta_traces" / "traces.csv")
     assert (trace["n_sys"], trace["n_user"], trace["tool_calls"], trace["finish_reason"]) == ("1", "1", "memory_search", "tool_calls")
     assert (trace["reasoning_tokens"], trace["cached_tokens"], trace["resp_reasoning_chars"]) == ("1400", "8800", "18")
