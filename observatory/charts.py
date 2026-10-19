@@ -398,31 +398,47 @@ def build(db, tz, day, thresholds, generated_at=None):
 
 
 def ensure(db, tz, day, root, thresholds, keep_days=KEEP_DAYS, force=False):
-    """Write root/<day>/ once (or again with force), point root/latest at it, prune old days. True if written."""
+    """Write root/<day>/ once (or again with force), then publish `latest` and prune old days. True if written.
+    Publishing runs on every call, so a crash between the directory rename and the link swap heals on the next run."""
     root = pathlib.Path(root)
     out = root / day
-    if (out / "report.html").exists() and not force:
-        return False
-    root.mkdir(parents=True, exist_ok=True)
-    page, data = build(db, tz, day, thresholds)
-    tmp = root / f".{day}.{os.getpid()}.tmp"
-    shutil.rmtree(tmp, ignore_errors=True)
-    tmp.mkdir()
-    (tmp / "report.html").write_text(page)
-    (tmp / "metrics.json").write_text(json.dumps(data, indent=1, sort_keys=True))
-    for p in [tmp, *tmp.iterdir()]:
-        os.chmod(p, 0o755 if p.is_dir() else 0o644)
-    shutil.rmtree(out, ignore_errors=True)
-    tmp.rename(out)
-    link = root / f".latest.{os.getpid()}.tmp"
-    link.unlink(missing_ok=True)
-    link.symlink_to(day)
-    os.replace(link, root / "latest")
-    cutoff = (datetime.date.fromisoformat(day) - datetime.timedelta(days=keep_days)).isoformat()
+    written = False
+    if force or not (out / "report.html").exists():
+        root.mkdir(parents=True, exist_ok=True)
+        page, data = build(db, tz, day, thresholds)
+        tmp = root / f".{day}.{os.getpid()}.tmp"
+        shutil.rmtree(tmp, ignore_errors=True)
+        tmp.mkdir()
+        (tmp / "report.html").write_text(page)
+        (tmp / "metrics.json").write_text(json.dumps(data, indent=1, sort_keys=True))
+        for p in [tmp, *tmp.iterdir()]:
+            os.chmod(p, 0o755 if p.is_dir() else 0o644)
+        shutil.rmtree(out, ignore_errors=True)
+        tmp.rename(out)
+        written = True
+    publish(root, keep_days)
+    return written
+
+
+def complete_days(root):
+    return sorted(p.name for p in root.iterdir() if DAY_DIR.match(p.name) and not p.is_symlink() and (p / "report.html").exists())
+
+
+def publish(root, keep_days=KEEP_DAYS):
+    """Point root/latest at the newest complete day (idempotent) and drop days older than keep_days before it."""
+    days = complete_days(root)
+    if not days:
+        return
+    newest, latest = days[-1], root / "latest"
+    if not (latest.is_symlink() and os.readlink(latest) == newest):
+        link = root / f".latest.{os.getpid()}.tmp"
+        link.unlink(missing_ok=True)
+        link.symlink_to(newest)
+        os.replace(link, latest)
+    cutoff = (datetime.date.fromisoformat(newest) - datetime.timedelta(days=keep_days)).isoformat()
     for p in root.iterdir():
         if p.is_dir() and not p.is_symlink() and DAY_DIR.match(p.name) and p.name < cutoff:
             shutil.rmtree(p)
-    return True
 
 
 def main():

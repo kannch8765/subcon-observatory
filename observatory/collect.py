@@ -6,7 +6,7 @@ recompute the daily rollup and write health.json + digest.json. Meant for a syst
     python3 -E -s -m observatory.collect --config ... --since 2026-08-01                # backfill (incl. letta_traces)
 
 TELEMETRY_DIR is the only place it writes. Letta exports are incremental: each run re-reads from one day before the
-newest ingested row (or --since). Once a day (first run at or after CHARTS_AFTER_HOUR local, default 6) it also writes
+newest ingested row (or --since). Once a day (first fully successful run at or after CHARTS_AFTER_HOUR local, default 6) it writes
 TELEMETRY_DIR/charts/<yesterday>/{report.html,metrics.json}; a chart failure is logged but never fails the run.
 """
 import argparse, datetime, fcntl, json, os, pathlib, shutil, sys, zoneinfo
@@ -48,11 +48,11 @@ def atomic_json(path, value):
 
 
 def daily_charts(db, now, tz, tdir, config, force=False):
-    """Yesterday's chart report, once the day's late rows have settled. Returns an error string or None."""
-    local = now.astimezone(tz)
-    if local.hour < int(config.get("CHARTS_AFTER_HOUR", "6")) and not force:
-        return None
+    """Yesterday's chart report, once the day's late rows have settled. Returns an error string or None.
+    Only called after a fully successful collection, so a report is never sealed with missing data."""
     try:
+        if now.astimezone(tz).hour < int(config.get("CHARTS_AFTER_HOUR") or 6) and not force:
+            return None
         charts.ensure(db, tz, rollup.recent_days(now, tz, 2)[1], tdir / "charts", health.thresholds(config),
                       keep_days=int(config.get("CHARTS_KEEP_DAYS", charts.KEEP_DAYS)), force=force)
     except Exception as error:  # the report is a nice-to-have; telemetry and health must still land
@@ -96,7 +96,8 @@ def run(config, since=None, now=None):
             yesterday = rollup.recent_days(now, tz, 2)[1]
             atomic_json(tdir / "digest.json", {**rollup.digest(db, yesterday), "generated_at": started, "overall": report["overall"]})
             ok = not errors
-            chart_error = daily_charts(db, now, tz, tdir, config, force=bool(since))
+            # After a failed collection, wait for a successful retry: the report is written once per day
+            chart_error = daily_charts(db, now, tz, tdir, config, force=bool(since)) if ok else None
             if chart_error:
                 errors["charts"] = chart_error
         except Exception as error:

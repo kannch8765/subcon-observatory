@@ -90,3 +90,60 @@ def test_ensure_prunes_old_days_and_keeps_latest(tmp_path):
     assert charts.ensure(db, TZ, "2026-10-18", root, {}, keep_days=30)
     assert not charts.ensure(db, TZ, "2026-10-18", root, {}, keep_days=30)
     assert sorted(p.name for p in root.iterdir()) == ["2026-10-01", "2026-10-18", "latest"]
+
+
+def test_failed_collection_waits_for_a_successful_retry(deployment, tmp_path, monkeypatch):
+    """Haru #2 review: a failed first eligible run must not seal an incomplete report for the day."""
+    from tests.test_collect import failing_export
+    config = config_for(deployment, tmp_path)
+    first = datetime.datetime(2026, 10, 16, 6, 17, tzinfo=TZ)
+    real_export = collect.export
+    monkeypatch.setattr(collect, "export", failing_export)
+    assert not collect.run(config, now=first)[0]
+    report = tmp_path / "telemetry" / "charts" / "2026-10-15" / "metrics.json"
+    assert not report.exists()
+    monkeypatch.setattr(collect, "export", real_export)
+    assert collect.run(config, since="2026-10-01", now=first + datetime.timedelta(hours=1))[0]
+    data = json.loads(report.read_text())
+    assert data["summary"]["last_7d"]["attempts"] == 1 and data["series"]["all"]["attempts"][-1] == 1
+
+
+def test_latest_heals_after_a_crash_between_rename_and_link(tmp_path, monkeypatch):
+    """Haru #2 review: publication must converge on retry, also on a first-ever publication."""
+    db = rollup_db(tmp_path, [("2026-10-17", "all", "attempts", 1), ("2026-10-18", "all", "attempts", 2)])
+    root = tmp_path / "charts"
+    real_replace = os.replace
+
+    def broken_replace(src, dst):
+        if str(dst).endswith("latest"):
+            raise OSError("injected")
+        real_replace(src, dst)
+
+    monkeypatch.setattr(charts.os, "replace", broken_replace)
+    try:
+        charts.ensure(db, TZ, "2026-10-17", root, {})
+    except OSError:
+        pass
+    assert (root / "2026-10-17" / "report.html").exists() and not (root / "latest").exists()  # first publication broke
+    monkeypatch.setattr(charts.os, "replace", real_replace)
+    assert not charts.ensure(db, TZ, "2026-10-17", root, {})  # not rewritten, but published
+    assert os.readlink(root / "latest") == "2026-10-17"
+
+    monkeypatch.setattr(charts.os, "replace", broken_replace)
+    try:
+        charts.ensure(db, TZ, "2026-10-18", root, {})
+    except OSError:
+        pass
+    assert os.readlink(root / "latest") == "2026-10-17"
+    monkeypatch.setattr(charts.os, "replace", real_replace)
+    charts.ensure(db, TZ, "2026-10-18", root, {})
+    assert os.readlink(root / "latest") == "2026-10-18"
+    assert not list(root.glob(".*.tmp"))
+
+
+def test_bad_chart_config_stays_inside_the_chart_boundary(deployment, tmp_path):
+    for value in ("", "six"):
+        config = {**config_for(deployment, tmp_path / value), "CHARTS_AFTER_HOUR": value}
+        ok, _, errors = collect.run(config, since="2026-10-01", now=NOW)
+        assert ok, errors
+        assert value == "" or errors["charts"].startswith("ValueError")  # empty = default hour
