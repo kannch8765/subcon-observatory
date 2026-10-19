@@ -130,17 +130,28 @@ def compute(db, tz, days):
         if r["outcome"] == "failed":
             acc.add(d, ["all"], f"opencode_failed:{r['status_code']}")
     out = acc.result()
-    # Backlog: the last sample taken on each day
-    last_sample = {}
-    for r in rows(db, "select distinct sampled_at from backlog_samples"):
-        if d := acc.day(r["sampled_at"]):
-            last_sample[d] = max(last_sample.get(d, ""), r["sampled_at"])
-    for d, sampled_at in last_sample.items():
-        gaps = [backlog_gap(r) for r in rows(db, "select * from backlog_samples where sampled_at = ?", (sampled_at,))]
+    # Point-in-time tables: the last sample taken on each day
+    for d, sample in last_samples(db, acc, "backlog_samples"):
+        gaps = [backlog_gap(r) for r in sample]
         metrics = out.setdefault((d, "all"), {})
         metrics["backlog_sessions"] = sum(1 for g in gaps if g > 2)
         metrics["backlog_lines"] = sum(gaps)
+    for d, sample in last_samples(db, acc, "letta_table_sizes"):
+        metrics = out.setdefault((d, "all"), {})
+        for r in sample:
+            if isinstance(r["total_bytes"], (int, float)):
+                metrics[f"pg_bytes:{r['relation']}"] = r["total_bytes"]
     return out
+
+
+def last_samples(db, acc, table):
+    """(day, rows of the last sample taken that day) for a `sample`-mode table."""
+    last = {}
+    for r in rows(db, f'select distinct sampled_at from "{table}"'):
+        if d := acc.day(r["sampled_at"]):
+            last[d] = max(last.get(d, ""), r["sampled_at"])
+    for d, sampled_at in last.items():
+        yield d, rows(db, f'select * from "{table}" where sampled_at = ?', (sampled_at,))
 
 
 def backlog_gap(row):

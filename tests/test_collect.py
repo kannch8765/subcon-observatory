@@ -161,9 +161,10 @@ def test_plan_does_not_touch_an_existing_database(deployment, tmp_path, monkeypa
     tdir = tmp_path / "telemetry"
     # Keep the collector's normal WAL mode: even a read-only open would add -wal / -shm sidecars here
     assert sqlite3.connect(tdir / "telemetry.db").execute("pragma journal_mode").fetchone()[0] == "wal"
-    before = {p.name: p.read_bytes() for p in tdir.iterdir()}
+    snapshot = lambda: {str(p.relative_to(tdir)): p.read_bytes() for p in tdir.rglob("*") if p.is_file()}
+    before = snapshot()
     steps = dict(collect.plan(config, None))
     monkeypatch.setattr(sys, "argv", ["collect", "--config", str(env), "--plan"])
     collect.main()
-    after = {p.name: p.read_bytes() for p in tdir.iterdir()}
+    after = snapshot()
     assert after == before and steps["letta"].startswith("<newest")

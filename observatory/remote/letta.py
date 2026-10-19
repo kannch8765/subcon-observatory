@@ -93,4 +93,17 @@ try:
 except RuntimeError:
     history_note = "block_history query failed (table missing in this Letta version?)"
 
-emit("letta", [steps, runs, messages, blocks, block_history], {"since": CONFIG.get("LETTA_SINCE") or None, "block_history": history_note})
+# Table sizes only (bytes, planner row estimates): tracks provider_traces growth for the retention decision.
+table_sizes = Table("table_sizes", [("relation", "ident"), ("total_bytes", "int"), ("row_estimate", "int")])
+try:  # a nice-to-have: never let it fail the whole letta export
+    for r in psql_rows("""select relname, total_bytes, row_estimate from (
+            select c.relname, pg_total_relation_size(c.oid) as total_bytes, greatest(c.reltuples, 0)::bigint as row_estimate
+            from pg_class c join pg_namespace n on n.oid = c.relnamespace
+            where n.nspname = 'public' and c.relkind = 'r' order by 2 desc limit 12) t
+        union all select '_database', pg_database_size(current_database()), null"""):
+        table_sizes.add(r["relname"], r["total_bytes"], r["row_estimate"])
+    sizes_note = "ok"
+except RuntimeError:
+    sizes_note = "table size query failed"
+
+emit("letta", [steps, runs, messages, blocks, block_history, table_sizes], {"since": CONFIG.get("LETTA_SINCE") or None, "block_history": history_note, "table_sizes": sizes_note})
