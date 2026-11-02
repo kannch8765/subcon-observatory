@@ -19,7 +19,10 @@ the conversation. The telemetry collector already copies each trace's metrics (s
 - **Fallback:** a request that isn't a JSON object with a `messages` list is kept as its original text.
 
 Requests are compared as **JSON values**, not bytes. Whitespace and number spelling may differ; keys, their order,
-strings and numbers' values don't. A request with a duplicated object key is kept as text, since parsing would drop one.
+strings and numbers' values don't. Numbers are compared exactly (as decimals), so a value a float can't hold, like
+`1e400` or a 20-digit fraction, is never "rebuilt" as a nearby float. A request that can't be split and rebuilt exactly
+is kept as text instead: a duplicated object key (parsing would drop one), such a number, `NaN`/`Infinity`, or nesting
+too deep to parse.
 
 ## A row may leave Postgres only if
 
@@ -33,7 +36,7 @@ A row that can't be read exactly (bytes that aren't UTF-8) or that fails to rebu
 
 | Step | What | Writes |
 |---|---|---|
-| 1 | `--plan`: per day, rows, raw size, new distinct messages, estimated archive size, rows that rebuild | nothing |
+| 1 | `--plan`: per day, rows, raw size, new distinct messages, estimated archive size (each blob zlib-compressed on its own; no framing, checksums or file system overhead, so not a storage guarantee), rows that rebuild | nothing |
 | 2 | `--archive`: write the archive (outside the Letta database, readable by root only), re-read and verify each row | archive only |
 | 3 | `--delete`: delete verified rows in small batches, re-checking each against Postgres first, then `VACUUM` | Postgres |
 | 4 | daily timer: steps 2 and 3 for the day that just left the window | both |

@@ -92,3 +92,38 @@ def test_stream_rows_reads_through_psql(tmp_path):
     assert [r["id"] for r in rows] == ["t1"] and rows[0]["source"] is None
     days, totals = ta.plan(rows)
     assert totals["split"] == 1 and totals["verify_failed"] == 0
+
+
+def test_numbers_a_float_cannot_hold_are_kept_verbatim_not_split():
+    # json.loads turns 1e400 into inf (and verify used to compare inf == inf); a 20-digit fraction loses digits.
+    for extra in ('1e400', '0.10000000000000000001', 'NaN', '-Infinity'):
+        req = '{"model": "m", "messages": [{"role": "user", "content": "hi"}], "temperature": ' + extra + '}'
+        split = ta.split_trace(row("t", req))
+        assert split.status == "whole" and split.record["request_text"] == req and not split.blobs, extra
+        assert ta.verify(row("t", req), split)
+    inside = '{"model": "m", "messages": [{"role": "user", "score": 1e400}]}'
+    assert ta.split_trace(row("t", inside)).status == "whole"
+
+
+def test_equal_numbers_spelled_differently_still_split():
+    req = '{"model": "m", "messages": [{"role": "user", "n": 1e5}], "temperature": 0.70}'
+    split = ta.split_trace(row("t", req))
+    assert split.status == "split" and ta.verify(row("t", req), split)
+
+
+def test_tampered_number_fails_exact_verification():
+    req = '{"model": "m", "messages": [{"role": "user", "content": "hi"}], "temperature": 0.7}'
+    split = ta.split_trace(row("t", req))
+    split.record["request_rest"]["temperature"] = 0.71
+    assert not ta.verify(row("t", req), split)
+
+
+def test_deeply_nested_request_is_kept_verbatim_and_does_not_stop_the_scan():
+    deep = '{"messages":' + '[' * 100_000 + '0' + ']' * 100_000 + '}'  # past the parser's recursion limit on any Python
+    rows = [row("good-1", request({"role": "user", "content": "a"})),
+            row("deep", deep),
+            row("good-2", request({"role": "user", "content": "b"}))]
+    split = ta.split_trace(rows[1])
+    assert split.status == "whole" and ta.verify(rows[1], split)
+    days, totals = ta.plan(rows)
+    assert (totals["rows"], totals["split"], totals["whole"], totals["verify_failed"]) == (3, 2, 1, 0)

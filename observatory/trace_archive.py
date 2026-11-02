@@ -12,7 +12,7 @@ This version only has --plan: it reads Postgres read-only, writes nothing anywhe
 would be archived, how much they take raw, how much the archive would add, and whether every row rebuilds.
 JSON is parsed here, not in Postgres: broken surrogates in stored payloads make PG's json functions fail.
 """
-import argparse, csv, datetime, hashlib, io, json, os, re, shlex, subprocess, sys, zlib
+import argparse, csv, datetime, decimal, hashlib, io, json, os, re, shlex, subprocess, sys, zlib
 from dataclasses import dataclass, field
 
 from observatory.export import load_config
@@ -43,6 +43,16 @@ def parse_json(text):
     return json.loads(text, object_pairs_hook=_no_duplicate_keys)
 
 
+def _no_constant(name):
+    raise ValueError(f"non-standard JSON constant {name}")
+
+
+def parse_exact(text):
+    """The JSON value with numbers exact: floats as Decimal (1e400 or a 20-digit fraction keep their value), and no
+    NaN/Infinity, which aren't JSON. Used to check that a split request rebuilds to the same value."""
+    return json.loads(text, object_pairs_hook=_no_duplicate_keys, parse_float=decimal.Decimal, parse_constant=_no_constant)
+
+
 def canonical(value):
     """Bytes a message is stored and hashed as. surrogatepass keeps lone surrogates from \\ud83d-style escapes."""
     return json.dumps(value, ensure_ascii=False, separators=(",", ":")).encode("utf-8", "surrogatepass")
@@ -65,17 +75,24 @@ def split_trace(row):
         return Split("undecodable")
     columns = {k: v for k, v in row.items() if k != "request_json"}
     raw = row.get("request_json")
+    whole = Split("whole", {"columns": columns, "request_text": raw})
+    # Anything that can't be split and rebuilt exactly is kept verbatim: not JSON, a duplicated key, a number a float
+    # can't hold (1e400 -> inf), or nesting too deep to parse (RecursionError must not stop the scan of other rows).
     try:
         request = parse_json(raw) if raw is not None else None
-    except ValueError:
-        request = None
-    messages = request.get("messages") if isinstance(request, dict) else None
-    if not isinstance(messages, list):
-        return Split("whole", {"columns": columns, "request_text": raw})
-    blobs = [(message_hash(b), b) for b in map(canonical, messages)]
-    rest = {k: v for k, v in request.items() if k != "messages"}
-    return Split("split", {"columns": columns, "request_rest": rest, "request_keys": list(request),
-                           "message_hashes": [h for h, _ in blobs]}, blobs)
+        messages = request.get("messages") if isinstance(request, dict) else None
+        if not isinstance(messages, list):
+            return whole
+        blobs = [(message_hash(b), b) for b in map(canonical, messages)]
+        rest = {k: v for k, v in request.items() if k != "messages"}
+        split = Split("split", {"columns": columns, "request_rest": rest, "request_keys": list(request),
+                                "message_hashes": [h for h, _ in blobs]}, blobs)
+        rebuilt = rebuild(split.record, dict(blobs).__getitem__)["request_json"]
+        if parse_exact(canonical(rebuilt).decode("utf-8", "surrogatepass")) != parse_exact(raw):
+            return whole
+        return split
+    except (ValueError, RecursionError):
+        return whole
 
 
 def rebuild(record, lookup):
@@ -93,16 +110,19 @@ def rebuild(record, lookup):
 
 
 def verify(row, split):
-    """True when the record rebuilds the row: other columns identical text, request the same JSON value."""
+    """True when the record rebuilds the row: other columns identical text, request the same JSON value with exact
+    numbers. Never raises: a row that can't be checked is simply not verified."""
     if split.status == "undecodable":
         return False
-    blobs = dict(split.blobs)
-    rebuilt = rebuild(split.record, blobs.__getitem__)
-    if {k: v for k, v in rebuilt.items() if k != "request_json"} != {k: v for k, v in row.items() if k != "request_json"}:
+    try:
+        rebuilt = rebuild(split.record, dict(split.blobs).__getitem__)
+        if {k: v for k, v in rebuilt.items() if k != "request_json"} != {k: v for k, v in row.items() if k != "request_json"}:
+            return False
+        if split.status == "whole":
+            return rebuilt["request_json"] == row.get("request_json")
+        return parse_exact(canonical(rebuilt["request_json"]).decode("utf-8", "surrogatepass")) == parse_exact(row["request_json"])
+    except (ValueError, RecursionError, KeyError):
         return False
-    if split.status == "whole":
-        return rebuilt["request_json"] == row.get("request_json")
-    return rebuilt["request_json"] == parse_json(row["request_json"])
 
 
 def decode_nulls(row):
@@ -144,7 +164,8 @@ def _size(value):
 
 
 def plan(rows, seen=None):
-    """Per-day dry run: (days {day: stats}, totals). `seen` = hashes already archived (none yet in this version)."""
+    """Per-day dry run: (days {day: stats}, totals). `seen` = hashes already archived (none yet in this version).
+    archive_bytes is an estimate: the sum of independently zlib-compressed blobs, not a measured archive size."""
     seen = set(seen or ())
     days = {}
     for row in rows:
@@ -173,6 +194,8 @@ def _mb(n):
 
 
 def report(days, totals, out=sys.stdout):
+    out.write("archive_MB is an estimate: each message and record zlib-compressed on its own, without the real archive's\n"
+              "framing, checksums or file system overhead. Not a storage guarantee.\n")
     out.write("day          rows    raw_MB  new_msg_MB  archive_MB  split  whole  undecodable  verify_failed\n")
     for day in sorted(days):
         d = days[day]
