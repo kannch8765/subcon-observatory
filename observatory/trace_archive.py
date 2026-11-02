@@ -23,9 +23,10 @@ DEFAULT_OLDER_THAN_DAYS = 30
 _DATE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 # psql reads bytes that aren't UTF-8 as surrogate escapes; a field containing one can't be archived exactly.
 _ESCAPED_BYTE = re.compile("[\udc80-\udcff]")
-# Python 3.12's csv reader can't tell an unquoted NULL from "", so psql writes NULL as this marker instead.
-# It isn't valid JSON and the other columns are ids, enums and timestamps, so no real value can equal it.
-NULL_MARKER = "~observatory-null-7c1e4b~"
+# Python's csv reader can't tell NULL from "" (or from any sentinel text), so NULL-ness travels separately: the
+# query adds one 0/1 digit per column in this extra column, computed by Postgres itself.
+NULL_MASK = "__observatory_null_mask"
+_IDENT = re.compile(r"^[a-z_][a-z0-9_]*$")
 
 
 class DuplicateKey(ValueError):
@@ -125,22 +126,44 @@ def verify(row, split):
         return False
 
 
-def decode_nulls(row):
-    """NULL_MARKER -> None."""
-    return {k: (None if v == NULL_MARKER else v) for k, v in row.items()}
+def decode_nulls(row, columns):
+    """Apply the per-column NULL mask: a 1 makes the value None, a 0 keeps the text exactly (even "")."""
+    mask = row.pop(NULL_MASK)
+    if len(mask) != len(columns) or set(mask) - {"0", "1"} or list(row) != columns:
+        raise RuntimeError("NULL mask doesn't match the columns")
+    return {c: (None if bit == "1" else row[c]) for c, bit in zip(columns, mask)}
 
 
-def stream_rows(config, where):
-    """provider_traces rows as dicts, NULL as None."""
+def _psql(config):
     env = {**os.environ, "PGOPTIONS": "-c default_transaction_read_only=on -c jit=off"}
     if config.get("LETTA_PG_LIBDIR"):
         env["LD_LIBRARY_PATH"] = config["LETTA_PG_LIBDIR"]
-    query = f"select * from provider_traces {where} order by created_at, id"
-    cmd = [config["LETTA_PSQL"], *shlex.split(config["LETTA_PG_ARGS"]), "-X", "-q",
-           "-c", f"\\copy ({query}) to stdout with (format csv, header, force_quote *, null '{NULL_MARKER}')"]
-    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, env=env)
+    return [config["LETTA_PSQL"], *shlex.split(config["LETTA_PG_ARGS"]), "-X", "-q"], env
+
+
+def trace_columns(config):
+    """provider_traces column names in table order (validated identifiers, so they can be quoted into the query)."""
+    cmd, env = _psql(config)
+    out = subprocess.run([*cmd, "-A", "-t", "-c", "select column_name from information_schema.columns "
+                          "where table_name = 'provider_traces' order by ordinal_position"],
+                         env=env, capture_output=True, text=True, check=True).stdout
+    columns = [line for line in out.splitlines() if line]
+    if not columns or any(not _IDENT.match(c) for c in columns) or NULL_MASK in columns:
+        raise RuntimeError(f"unexpected provider_traces columns: {columns!r}")
+    return columns
+
+
+def stream_rows(config, where):
+    """provider_traces rows as dicts, NULL as None (from the mask, never from the text)."""
+    columns = trace_columns(config)
+    mask = "concat(" + ", ".join(f'("{c}" is null)::int' for c in columns) + ")"
+    select = ", ".join(f'"{c}"' for c in columns)
+    query = f'select {select}, {mask} as {NULL_MASK} from provider_traces {where} order by created_at, id'
+    cmd, env = _psql(config)
+    proc = subprocess.Popen([*cmd, "-c", f"\\copy ({query}) to stdout with (format csv, header, force_quote *)"],
+                            stdout=subprocess.PIPE, env=env)
     text = io.TextIOWrapper(proc.stdout, encoding="utf-8", errors="surrogateescape", newline="")
-    yield from map(decode_nulls, csv.DictReader(text))
+    yield from (decode_nulls(row, columns) for row in csv.DictReader(text))
     if proc.wait() != 0:
         raise RuntimeError(f"psql exited with {proc.returncode}")
 
@@ -176,6 +199,8 @@ def plan(rows, seen=None):
         stats["raw_bytes"] += sum(_size(v) for v in row.values())
         split = split_trace(row)
         stats[split.status] += 1
+        if split.status == "undecodable":
+            continue  # counted once, as undecodable; verify_failed is only for rows that could be read
         if not verify(row, split):
             stats["verify_failed"] += 1
             continue

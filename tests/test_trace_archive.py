@@ -45,6 +45,12 @@ def test_undecodable_bytes_are_never_archivable():
     assert split.status == "undecodable" and not ta.verify(bad, split)
 
 
+def test_undecodable_and_verify_failed_are_disjoint_counts():
+    bad = row("t", request({"role": "user", "content": "ok"}), response_json='{"x": "\udcff"}')
+    days, totals = ta.plan([bad, row("ok", request({"role": "user", "content": "fine"}))])
+    assert (totals["rows"], totals["undecodable"], totals["verify_failed"], totals["split"]) == (2, 1, 0, 1)
+
+
 def test_tampered_record_fails_verification():
     original = row("t", request({"role": "user", "content": "hi"}))
     split = ta.split_trace(original)
@@ -80,8 +86,22 @@ def test_where_clause_bounds_and_validation():
         ta.where_clause(30, "2026-08-08'; drop table x; --", now=now)
 
 
-def test_null_marker_decodes_to_none_and_empty_string_stays():
-    assert ta.decode_nulls({"id": "t1", "source": ta.NULL_MARKER, "note": ""}) == {"id": "t1", "source": None, "note": ""}
+def test_null_mask_decides_null_never_the_text():
+    columns = ["id", "source", "note"]
+    assert ta.decode_nulls({"id": "t1", "source": "", "note": "", ta.NULL_MASK: "010"}, columns) == {"id": "t1", "source": None, "note": ""}
+    with pytest.raises(RuntimeError):
+        ta.decode_nulls({"id": "t1", "source": "", "note": "", ta.NULL_MASK: "01"}, columns)
+
+
+def test_csv_round_trip_keeps_null_and_every_text_value_apart(tmp_path):
+    # Haru round 2: a real text value equal to a NULL sentinel used to come back as None and still "verify".
+    texts = ["", "~observatory-null-7c1e4b~", "NULL", "\\N", 'say "hi", then\nnew line', "0"]
+    rows = [row(f"t{i}", text, source=text) for i, text in enumerate(texts)] + [row("tn", None, source=None)]
+    fixtures = tmp_path / "letta.json"
+    fixtures.write_text(json.dumps({"provider_traces": rows}))
+    got = list(ta.stream_rows({"LETTA_PSQL": str(FAKE_PSQL), "LETTA_PG_ARGS": str(fixtures)}, "where true"))
+    assert [(r["request_json"], r["source"]) for r in got] == [(t, t) for t in texts] + [(None, None)]
+    assert got == rows
 
 
 def test_stream_rows_reads_through_psql(tmp_path):
