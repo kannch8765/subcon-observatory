@@ -337,10 +337,12 @@ def verify_archived(reader, row):
 
 
 def _flush(db, path, batch, days):
-    """Write a batch in one transaction, then re-read it through a second, read-only connection and mark verified only
-    the rows that rebuild. A row already archived with a different record (the Postgres row changed) is a conflict:
-    neither copy is touched, and it never becomes verified."""
-    reread, archived_at = [], _now()
+    """Write a batch in one transaction, then re-read the whole batch through a second, read-only connection: a row is
+    verified only while it rebuilds. That includes rows an earlier run verified (`already`), so a damaged archive is
+    caught on the next run instead of being trusted forever; a row that fails loses its mark. A row already archived
+    with a different record (the Postgres row changed) is a conflict: its record stays as it is, but it loses its
+    verified mark, since it no longer holds what Postgres holds."""
+    reread, conflicts, archived_at = [], [], _now()
     with db:
         for day, row, split in batch:
             record = canonical(split.record)
@@ -348,9 +350,7 @@ def _flush(db, path, batch, days):
             old = db.execute("select record_sha256, verified_at from traces where id = ?", (row["id"],)).fetchone()
             if old and old[0] != digest:
                 days[day]["conflict"] += 1
-                continue
-            if old and old[1]:
-                days[day]["already"] += 1
+                conflicts.append((row["id"],))
                 continue
             if not old:  # (an unverified old row, e.g. from an interrupted run, is only re-checked below)
                 for message, blob in split.blobs:  # most messages repeat: look before compressing
@@ -363,17 +363,20 @@ def _flush(db, path, batch, days):
                            (row["id"], day, row.get("created_at"), split.status, digest, z, archived_at))
                 days[day]["added_bytes"] += len(z)
                 days[day]["new"] += 1
-            reread.append((day, row))
+            reread.append((day, row, bool(old and old[1])))
+        db.executemany("update traces set verified_at = null where id = ?", conflicts)
     reader = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
     try:
-        checked = [(day, row["id"], verify_archived(reader, row)) for day, row in reread]
+        checked = [(day, row["id"], was, verify_archived(reader, row)) for day, row, was in reread]
     finally:
         reader.close()
-    with db:
+    with db:  # a row verified before keeps its first verified_at
         db.executemany("update traces set verified_at = ? where id = ?",
-                       [(_now(), trace_id) for _, trace_id, ok in checked if ok])
-    for day, _, ok in checked:
-        days[day]["verified" if ok else "reread_failed"] += 1
+                       [(_now(), trace_id) for _, trace_id, was, ok in checked if ok and not was])
+        db.executemany("update traces set verified_at = null where id = ?",
+                       [(trace_id,) for _, trace_id, _, ok in checked if not ok])
+    for day, _, was, ok in checked:
+        days[day]["reread_failed" if not ok else "already" if was else "verified"] += 1
 
 
 def archive_rows(db, path, rows, batch_bytes=BATCH_BYTES):
@@ -402,8 +405,8 @@ def archive_rows(db, path, rows, batch_bytes=BATCH_BYTES):
 
 
 def day_counts(config, where):
-    """[(day, rows)] in range, oldest first. Selects no content, so each day can then be read in its own short
-    read-only transaction instead of one long one for the whole range."""
+    """[(day, rows)] in range, oldest first. Selects no content, so each day can then be read in its own read-only
+    transaction (open while that day is archived) instead of one for the whole range."""
     query = (f"select to_char(created_at, 'YYYY-MM-DD') as day, count(*) as rows from provider_traces {where} "
              "group by 1 order by 1")
     cmd, env = _psql(config)
@@ -415,7 +418,8 @@ def day_counts(config, where):
 def run_archive(config, directory, older_than_days=DEFAULT_OLDER_THAN_DAYS, date_from=None, date_to=None,
                 min_free_gb=DEFAULT_MIN_FREE_GB, now=None, out=sys.stdout):
     """Archive every day in range, oldest first; stops before a day if free space is under `min_free_gb`.
-    Returns 0, or 3 when it stopped for space."""
+    Returns 3 when it stopped for space, else 4 when any row is a conflict or failed its re-read (so a timer doesn't
+    report success), else 0. Rows that can't be archived at all (undecodable, verify_failed) are only counted."""
     now = now or datetime.datetime.now(datetime.timezone.utc)  # one cutoff for the whole run
     where = where_clause(older_than_days, date_from, date_to, now=now)
     db, path, lock = open_archive(directory)
@@ -433,7 +437,9 @@ def run_archive(config, directory, older_than_days=DEFAULT_OLDER_THAN_DAYS, date
             db.execute("update runs set finished_at = ?, totals = ? where run = ?",
                        (_now(), json.dumps({**totals, "stopped": stopped}), run))
         archive_report(days, totals, os.path.getsize(path), stopped, out)
-        return 3 if stopped else 0
+        if stopped:
+            return 3
+        return 4 if totals["conflict"] or totals["reread_failed"] else 0
     finally:
         db.close()
         lock.close()
@@ -478,7 +484,8 @@ def restore_rows(reader, day):
 
 def write_csv(rows, path):
     """Rows as psql CSV: every value quoted, NULL as an empty unquoted field (so "" stays an empty string), UTF-8.
-    The file is created 600 and never overwritten; a failed write leaves no file. Returns (rows, column order)."""
+    The file is created 600 and never overwritten; a failed write, or no rows at all, leaves no file. Returns (rows,
+    column order)."""
     fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     columns, n = [], 0
     try:
@@ -495,6 +502,8 @@ def write_csv(rows, path):
     except BaseException:
         os.unlink(path)
         raise
+    if not n:  # no header either: an empty file would only invite a `\copy` with no columns
+        os.unlink(path)
     return n, columns
 
 
@@ -524,6 +533,9 @@ def main():
             parser.error("--restore-day needs a YYYY-MM-DD day and --out")
         reader = sqlite3.connect(f"file:{os.path.join(args.archive_dir, ARCHIVE_DB)}?mode=ro", uri=True)
         n, columns = write_csv(restore_rows(reader, args.restore_day), args.out)
+        if not n:
+            print(f"no verified rows for {args.restore_day}; nothing written")
+            return
         print(f"{n} rows -> {args.out}. Load with:\n"
               f"  \\copy provider_traces ({', '.join(columns)}) from '{args.out}' with (format csv, header match)")
         return

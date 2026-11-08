@@ -1,5 +1,5 @@
 """Trace archive step 2: --archive writes, re-reads and verifies; --restore-day gives the rows back as psql CSV."""
-import datetime, io, json, os, sqlite3, stat, zlib
+import datetime, io, json, os, sqlite3, stat, subprocess, sys, zlib
 
 import pytest
 
@@ -67,16 +67,20 @@ def test_second_run_adds_nothing_and_counts_already(tmp_path):
     assert os.path.getsize(os.path.join(directory, ta.ARCHIVE_DB)) == size
 
 
-def test_changed_postgres_row_is_a_conflict_and_the_archived_copy_is_kept(tmp_path):
+def test_changed_postgres_row_is_a_conflict_keeps_the_archived_copy_but_unverifies_it(tmp_path):
     rows = fixture_rows()
     config, directory = setup(tmp_path, rows)
     run(config, directory)
-    before = archive_db(directory).execute("select record_sha256, verified_at from traces where id = 'b'").fetchone()
+    before = archive_db(directory).execute("select record_sha256 from traces where id = 'b'").fetchone()
     rows[1]["response_json"] = '{"choices": ["changed"]}'
     (tmp_path / "letta.json").write_text(json.dumps({"provider_traces": rows}))
-    run(config, directory)
-    assert last_totals(directory)["conflict"] == 1
-    assert archive_db(directory).execute("select record_sha256, verified_at from traces where id = 'b'").fetchone() == before
+    for _ in range(2):  # stays a conflict, and unverified, for as long as the two differ
+        code, _ = run(config, directory)
+        assert code == 4 and last_totals(directory)["conflict"] == 1
+        # The old copy no longer holds what Postgres holds: it must not count as verified (nor be restored)
+        assert archive_db(directory).execute("select record_sha256, verified_at from traces where id = 'b'").fetchone() == (*before, None)
+    reader = sqlite3.connect(f"file:{os.path.join(directory, ta.ARCHIVE_DB)}?mode=ro", uri=True)
+    assert [r["id"] for r in ta.restore_rows(reader, "2026-08-08")] == ["a"]
 
 
 def test_reread_catches_a_damaged_archive_and_leaves_the_row_unverified(tmp_path):
@@ -90,10 +94,29 @@ def test_reread_catches_a_damaged_archive_and_leaves_the_row_unverified(tmp_path
         db.execute("update traces set verified_at = null where id = 'c'")  # as if a run stopped before marking it
     reader = sqlite3.connect(f"file:{os.path.join(directory, ta.ARCHIVE_DB)}?mode=ro", uri=True)
     assert not ta.verify_archived(reader, rows[2])
-    run(config, directory)
+    code, _ = run(config, directory)
     t = last_totals(directory)
-    assert (t["reread_failed"], t["already"]) == (1, 3)
-    assert db.execute("select verified_at from traces where id = 'c'").fetchone() == (None,)
+    assert code == 4
+    # a, b and c all hold SHARED: c (unverified) and a, b (verified by the first run) fail the re-read; d doesn't
+    assert (t["reread_failed"], t["already"], t["verified"]) == (3, 1, 0)
+    assert [i for (i,) in db.execute("select id from traces where verified_at is not null")] == ["d"]
+
+
+def test_already_verified_rows_are_reread_on_every_run(tmp_path):
+    # A verified mark is not trusted forever: damage after a fully verified run is caught by the next run
+    config, directory = setup(tmp_path, fixture_rows())
+    assert run(config, directory)[0] == 0
+    db = archive_db(directory)
+    first = dict(db.execute("select id, verified_at from traces"))
+    reply = ta.message_hash(ta.canonical({"role": "assistant", "content": "reply"}))  # only in row b
+    with db:
+        db.execute("update messages set z = ? where hash = ?", (zlib.compress(b'{"role":"assistant"}'), reply))
+    code, _ = run(config, directory)
+    t = last_totals(directory)
+    assert code == 4 and (t["reread_failed"], t["already"], t["verified"]) == (1, 3, 0)
+    marks = dict(db.execute("select id, verified_at from traces"))
+    assert marks["b"] is None
+    assert {i: m for i, m in marks.items() if i != "b"} == {i: m for i, m in first.items() if i != "b"}  # kept as they were
 
 
 def test_damaged_record_and_missing_trace_fail_verification(tmp_path):
@@ -194,6 +217,18 @@ def test_csv_keeps_null_and_empty_apart_and_is_private(tmp_path):
     assert stat.S_IMODE(os.stat(path).st_mode) == 0o600
     with pytest.raises(FileExistsError):
         ta.write_csv(iter(rows), str(path))
+
+
+def test_restore_of_a_day_without_verified_rows_writes_nothing(tmp_path):
+    path = tmp_path / "day.csv"
+    assert ta.write_csv(iter([]), str(path)) == (0, [])
+    assert not path.exists()
+    config, directory = setup(tmp_path, fixture_rows())
+    run(config, directory)
+    out = subprocess.run([sys.executable, "-m", "observatory.trace_archive", "--restore-day", "2026-08-10",
+                          "--archive-dir", directory, "--out", str(path)], capture_output=True, text=True, check=True,
+                         cwd=os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    assert out.stdout == "no verified rows for 2026-08-10; nothing written\n" and not path.exists()
 
 
 def test_failed_csv_write_leaves_no_file(tmp_path):

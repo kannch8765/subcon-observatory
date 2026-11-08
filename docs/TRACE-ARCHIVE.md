@@ -59,23 +59,32 @@ One SQLite file, `provider_traces.sqlite3`, in a directory that must belong to t
 | `meta` | `format` = 1 |
 | `runs` | when each `--archive` run started and finished, its range, and its counts |
 
-`--archive` works one day at a time, oldest first, each day in its own short read-only Postgres transaction:
+`--archive` works one day at a time, oldest first, each day in its own read-only Postgres transaction (open while that
+day is read and archived, so one snapshot per day, never one for the whole range):
 
 1. Read the day's rows and split them; a row that doesn't rebuild in memory is counted and left out.
 2. Write new messages and records in one SQLite transaction per batch (about 64 MB of rows), so a crash leaves no half
    row.
 3. Re-read the batch through a second, read-only connection: every message and record must match its hash, and the
    rebuilt row must equal the Postgres row. Only then is `verified_at` set.
-4. Run again any time: a row already verified with the same record counts as `already`. If the Postgres row has changed
-   since it was archived, it's a `conflict`: neither copy is touched, and it never counts as verified.
+4. Run again any time: a row already verified with the same record is re-read the same way and counts as `already`; if
+   it no longer rebuilds (a damaged archive), it counts as `reread_failed` and loses its `verified_at`. If the Postgres
+   row has changed since it was archived, it's a `conflict`: the archived record is kept as it is but loses its
+   `verified_at` (it no longer holds what Postgres holds), and it stays unverified while the two differ.
+
+`verified_at` means "rebuilt the Postgres row at the last check", not a standing guarantee: step 3 re-checks every row
+against both the archive and Postgres right before deleting it. A Letta schema change (a column added or renamed) changes
+every record, so all old rows would show as `conflict`; that needs its own handling before step 3/4 runs unattended.
 
 It holds an exclusive lock for the whole run and stops before a day when the archive's file system has less than
-`--min-free-gb` (default 2) free (exit code 3).
+`--min-free-gb` (default 2) free. Exit codes: 0 all good; 3 stopped for space; 4 at least one `conflict` or
+`reread_failed` (look before any delete). Rows that can't be archived at all (`undecodable`, `verify_failed`) are only
+counted: they never leave Postgres.
 
 `--restore-day` rebuilds the day's verified rows and writes them as psql CSV (every value quoted, NULL as an empty
 unquoted field, file created 600, never overwritten) and prints the `\copy provider_traces (...) from ... with (format
 csv, header match)` that loads it. Hashes are checked on the way out: after a delete there's no Postgres row left to
-compare with. The restored request is the same JSON value, not the same bytes (whitespace and number spelling may
+compare with. A day without verified rows writes no file. The restored request is the same JSON value, not the same bytes (whitespace and number spelling may
 differ, as above); lone surrogates from `\ud83d`-style escapes are written as escapes again, so the file is valid UTF-8.
 
 ## Privacy
