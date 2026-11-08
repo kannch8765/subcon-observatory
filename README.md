@@ -61,16 +61,18 @@ deploy markers, a table per chart) and `metrics.json` (the numbers behind it). `
 uv run python -m observatory.charts --db telemetry.db --out out/charts --day 2026-10-18
 ```
 
-### Trace archive (plan only so far)
+### Trace archive (plan + archive; nothing is deleted yet)
 
 `observatory.trace_archive --plan` checks, read-only, how much of `provider_traces` could move into a lossless,
-deduplicated archive (each distinct message stored once) and whether every old row rebuilds exactly. Nothing is
-archived or deleted yet; see [docs/TRACE-ARCHIVE.md](docs/TRACE-ARCHIVE.md) for the rules and the next steps.
+deduplicated archive (each distinct message stored once) and whether every old row rebuilds exactly. `--archive` writes
+that archive to a root-only SQLite file, re-reads every row from disk and marks it verified only if it rebuilds the
+Postgres row; `--restore-day` writes verified rows back out as CSV for psql. Nothing deletes from Postgres yet; see
+[docs/TRACE-ARCHIVE.md](docs/TRACE-ARCHIVE.md) for the rules and the next steps.
 
 Each snapshot has a `snapshot.json` (row and redaction counts per table, plus the observatory commit) and one directory per exporter.
 
 ## Roadmap
 
 - Weekly report delivery through the Subcon review bot
-- `provider_traces` retention: archive first, then delete only rows that rebuild from the archive ([docs/TRACE-ARCHIVE.md](docs/TRACE-ARCHIVE.md))
+- `provider_traces` retention: analyse, archive, verify, then delete only rows that telemetry has and that rebuild from the archive ([docs/TRACE-ARCHIVE.md](docs/TRACE-ARCHIVE.md))
 - Swap the SSH export for a dedicated telemetry store once it exists
