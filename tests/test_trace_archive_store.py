@@ -119,6 +119,41 @@ def test_already_verified_rows_are_reread_on_every_run(tmp_path):
     assert {i: m for i, m in marks.items() if i != "b"} == {i: m for i, m in first.items() if i != "b"}  # kept as they were
 
 
+def test_verified_row_that_postgres_can_no_longer_give_exactly_loses_its_mark(tmp_path):
+    rows = fixture_rows()
+    config, directory = setup(tmp_path, rows)
+    assert run(config, directory)[0] == 0  # "bad" is undecodable but was never archived: report-only, exit 0
+    rows[1]["response_json"] = '{"x": "\udcff"}'  # b, verified above, now holds a byte that isn't UTF-8
+    (tmp_path / "letta.json").write_text(json.dumps({"provider_traces": rows}))
+    code, _ = run(config, directory)
+    t = last_totals(directory)
+    assert code == 4 and (t["undecodable"], t["reread_failed"], t["already"]) == (1, 1, 3)
+    db = archive_db(directory)
+    assert db.execute("select verified_at from traces where id = 'b'").fetchone() == (None,)
+    assert db.execute("select count(*) from traces where id = 'b'").fetchone() == (1,)  # the archived bytes stay
+    reader = sqlite3.connect(f"file:{os.path.join(directory, ta.ARCHIVE_DB)}?mode=ro", uri=True)
+    assert [r["id"] for r in ta.restore_rows(reader, "2026-08-08")] == ["a"]
+
+
+@pytest.mark.parametrize("column, value", [("day", "2026-08-09"), ("created_at", "2026-08-08 11:00:01+09"),
+                                           ("status", "whole")])
+def test_lookup_columns_must_match_the_record(tmp_path, column, value):
+    # restore finds rows by day; a re-run must not certify a copy filed under the wrong day (or time, or status)
+    config, directory = setup(tmp_path, fixture_rows())
+    run(config, directory)
+    with archive_db(directory) as db:
+        db.execute(f"update traces set {column} = ? where id = 'b'", (value,))
+    path = os.path.join(directory, ta.ARCHIVE_DB)
+    with pytest.raises(ValueError, match="lookup columns"):  # restore refuses it while it still has its mark
+        list(ta.restore_rows(sqlite3.connect(f"file:{path}?mode=ro", uri=True), "2026-08-09" if column == "day" else "2026-08-08"))
+    code, _ = run(config, directory)
+    t = last_totals(directory)
+    assert code == 4 and (t["reread_failed"], t["already"]) == (1, 3)
+    assert archive_db(directory).execute("select verified_at from traces where id = 'b'").fetchone() == (None,)
+    reader = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+    assert [r["id"] for d in ("2026-08-08", "2026-08-09") for r in ta.restore_rows(reader, d)] == ["a", "c", "d"]
+
+
 def test_damaged_record_and_missing_trace_fail_verification(tmp_path):
     rows = fixture_rows()
     config, directory = setup(tmp_path, rows)

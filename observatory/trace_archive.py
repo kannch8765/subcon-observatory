@@ -312,19 +312,32 @@ def load_message(reader, digest):
     return blob
 
 
+def trace_day(created_at):
+    """A trace's day key in the archive: the date part of its created_at text (server time zone)."""
+    return (created_at or "")[:10] or "unknown"
+
+
 def load_record(reader, trace_id):
-    """(status, record) from the archive; raises KeyError if missing, ValueError if it doesn't match its hash."""
-    got = reader.execute("select status, record_sha256, record_z from traces where id = ?", (trace_id,)).fetchone()
+    """(status, record) from the archive; raises KeyError if missing, ValueError if it doesn't match its hash or if the
+    unhashed lookup columns (id, day, created_at, status) disagree with the hashed record: restore finds rows by them."""
+    got = reader.execute("select status, record_sha256, record_z, day, created_at from traces where id = ?",
+                         (trace_id,)).fetchone()
     if got is None:
         raise KeyError(trace_id)
-    status, digest, z = got
+    status, digest, z, day, created_at = got
     try:
         blob = zlib.decompress(z)
     except zlib.error as exc:
         raise ValueError("record blob doesn't decompress") from exc
     if hashlib.sha256(blob).hexdigest() != digest:
         raise ValueError("record doesn't match its hash")
-    return status, json.loads(blob.decode("utf-8", "surrogatepass"))
+    record = json.loads(blob.decode("utf-8", "surrogatepass"))
+    columns = record["columns"]
+    implied = (trace_id, trace_day(columns.get("created_at")), columns.get("created_at"),
+               "whole" if "request_text" in record else "split")
+    if (columns.get("id"), day, created_at, status) != implied:
+        raise ValueError("lookup columns don't match the record")
+    return status, record
 
 
 def verify_archived(reader, row):
@@ -341,16 +354,26 @@ def _flush(db, path, batch, days):
     verified only while it rebuilds. That includes rows an earlier run verified (`already`), so a damaged archive is
     caught on the next run instead of being trusted forever; a row that fails loses its mark. A row already archived
     with a different record (the Postgres row changed) is a conflict: its record stays as it is, but it loses its
-    verified mark, since it no longer holds what Postgres holds."""
-    reread, conflicts, archived_at = [], [], _now()
+    verified mark, since it no longer holds what Postgres holds. A row Postgres now holds in a form that can't be archived
+    (`rejected`: undecodable or verify_failed) is only counted as such, unless an earlier run verified it: then that copy
+    is stale too, loses its mark, and counts as `reread_failed`."""
+    reread, unmark, archived_at = [], [], _now()
     with db:
-        for day, row, split in batch:
+        for day, row, split, rejected in batch:
+            if rejected:
+                # an id with escaped bytes can't be in the archive (and SQLite can't take it as a parameter)
+                old = None if _ESCAPED_BYTE.search(row["id"]) else db.execute(
+                    "select verified_at from traces where id = ?", (row["id"],)).fetchone()
+                if old and old[0]:
+                    unmark.append((row["id"],))
+                days[day]["reread_failed" if old and old[0] else rejected] += 1
+                continue
             record = canonical(split.record)
             digest = hashlib.sha256(record).hexdigest()
             old = db.execute("select record_sha256, verified_at from traces where id = ?", (row["id"],)).fetchone()
             if old and old[0] != digest:
                 days[day]["conflict"] += 1
-                conflicts.append((row["id"],))
+                unmark.append((row["id"],))
                 continue
             if not old:  # (an unverified old row, e.g. from an interrupted run, is only re-checked below)
                 for message, blob in split.blobs:  # most messages repeat: look before compressing
@@ -364,7 +387,7 @@ def _flush(db, path, batch, days):
                 days[day]["added_bytes"] += len(z)
                 days[day]["new"] += 1
             reread.append((day, row, bool(old and old[1])))
-        db.executemany("update traces set verified_at = null where id = ?", conflicts)
+        db.executemany("update traces set verified_at = null where id = ?", unmark)
     reader = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
     try:
         checked = [(day, row["id"], was, verify_archived(reader, row)) for day, row, was in reread]
@@ -381,20 +404,19 @@ def _flush(db, path, batch, days):
 
 def archive_rows(db, path, rows, batch_bytes=BATCH_BYTES):
     """Archive the rows that rebuild in memory, in batches of about `batch_bytes`; per-day stats. Rows that can't be
-    read exactly or don't rebuild are counted and left out: they can never be deleted."""
+    read exactly or don't rebuild are left out (they can never be deleted) and are counted in `_flush`, which also takes
+    the mark off an earlier verified copy of them; only their id is kept in memory."""
     days, batch, size = {}, [], 0
     for row in rows:
-        day = (row.get("created_at") or "")[:10] or "unknown"
+        day = trace_day(row.get("created_at"))
         stats = days.setdefault(day, dict.fromkeys(ARCHIVE_STATS, 0))
         stats["rows"] += 1
         split = split_trace(row)
-        if split.status == "undecodable":
-            stats["undecodable"] += 1
+        rejected = "undecodable" if split.status == "undecodable" else None if verify(row, split) else "verify_failed"
+        if rejected:
+            batch.append((day, {"id": row["id"]}, None, rejected))
             continue
-        if not verify(row, split):
-            stats["verify_failed"] += 1
-            continue
-        batch.append((day, row, split))
+        batch.append((day, row, split, None))
         size += sum(_size(v) for v in row.values())
         if size >= batch_bytes:
             _flush(db, path, batch, days)
