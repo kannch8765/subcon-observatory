@@ -72,9 +72,9 @@ def test_delete_removes_exactly_the_archived_analysed_old_rows_then_vacuums(tmp_
     assert (t["deleted"], t["not_archived"], t["mismatch"], t["changed"], t["vacuum"]) == (4, 1, 0, 0, "done")
     db = archive_db(directory)
     run_id = db.execute("select max(run) from runs").fetchone()[0]
-    assert sorted(db.execute("select id, day, run, requested_at is not null, deleted_at is not null from deletions")) == [
-        ("a", "2026-08-08", run_id, 1, 1), ("b", "2026-08-08", run_id, 1, 1), ("c", "2026-08-09", run_id, 1, 1),
-        ("d", "2026-08-09", run_id, 1, 1)]
+    assert sorted(db.execute("select id, day, run, outcome, requested_at <= resolved_at from deletions")) == [
+        ("a", "2026-08-08", run_id, "deleted", 1), ("b", "2026-08-08", run_id, "deleted", 1),
+        ("c", "2026-08-09", run_id, "deleted", 1), ("d", "2026-08-09", run_id, "deleted", 1)]
     assert db.execute("select finished_at is not null from runs where run = ?", (run_id,)).fetchone() == (1,)
     assert len(queries(tmp_path, "vacuum")) == 1
     # The DELETE statement itself re-checks each row's md5 and the cutoff
@@ -87,7 +87,7 @@ def test_second_run_finds_nothing_left_and_does_not_vacuum(tmp_path):
     delete(config, directory)
     code, _ = delete(config, directory)
     t = totals(directory)
-    assert code == 0 and (t["rows"], t["deleted"], t["not_archived"], t["vacuum"]) == (1, 0, 1, "skipped")
+    assert code == 0 and (t["rows"], t["deleted"], t["not_archived"], t["vacuum"]) == (1, 0, 1, "not_run")
     assert len(queries(tmp_path, "vacuum")) == 1
 
 
@@ -144,6 +144,41 @@ def test_damaged_message_blob_keeps_every_row_that_uses_it(tmp_path):
     assert totals(directory)["mismatch"] == 3
 
 
+@pytest.mark.parametrize("before, after", [("true", "1"), ("false", "0"), ("true", "1.0")])
+def test_a_boolean_that_became_a_number_is_a_mismatch_and_the_row_stays(tmp_path, before, after):
+    rows = fixture_rows()
+    rows[0]["request_json"] = request(SHARED, {"role": "user", "content": "x", "meta": {"flags": [{"option": json.loads(before)}]}})
+    config, directory, rows = archived(tmp_path, rows)
+    rows[0]["request_json"] = rows[0]["request_json"].replace(f'"option": {before}', f'"option": {after}')
+    assert f'"option": {after}' in rows[0]["request_json"]
+    write_rows(tmp_path, rows)
+    code, _ = delete(config, directory)
+    assert code == 4 and "a" in postgres_ids(tmp_path) and totals(directory)["mismatch"] == 1
+
+
+def test_reordered_keys_are_a_mismatch_too(tmp_path):
+    rows = fixture_rows()
+    config, directory, rows = archived(tmp_path, rows)
+    request_value = json.loads(rows[0]["request_json"])
+    rows[0]["request_json"] = json.dumps(dict(reversed(list(request_value.items()))), ensure_ascii=False)
+    write_rows(tmp_path, rows)
+    code, _ = delete(config, directory)
+    assert code == 4 and "a" in postgres_ids(tmp_path) and totals(directory)["mismatch"] == 1
+
+
+def test_json_equal_is_exact():
+    from decimal import Decimal
+    p = ta.parse_exact
+    for a, b in [("true", "1"), ("false", "0"), ("[true]", "[1]"), ('{"a": false}', '{"a": 0}'), ("1", '"1"'),
+                 ("null", "0"), ("null", "false"), ('{"a": 1, "b": 2}', '{"b": 2, "a": 1}'), ("[1, 2]", "[2, 1]"),
+                 ("[1]", "[1, 1]"), ("1.5", "1.50001"), ('{"a": {}}', '{"a": []}')]:
+        assert not ta.json_equal(p(a), p(b)), (a, b)
+    for a, b in [("1", "1.0"), ("1e2", "100"), ("1.50", "1.5"), ('{"a": [true, null, "x"]}', '{"a":[true,null,"x"]}'),
+                 ("0.1234567890123456789012345", "0.1234567890123456789012345")]:
+        assert ta.json_equal(p(a), p(b)), (a, b)
+    assert ta.json_equal(Decimal("1"), 1) and not ta.json_equal(True, Decimal("1"))
+
+
 def test_postgres_row_changed_after_archiving_stays(tmp_path):
     config, directory, rows = archived(tmp_path)
     rows[1]["response_json"] = '{"choices": ["changed"]}'
@@ -170,7 +205,7 @@ def test_row_changed_between_check_and_delete_stays(tmp_path, monkeypatch):
     assert code == 4 and postgres_ids(tmp_path) == ["bad", "c", "new"]
     t = totals(directory)
     assert (t["deleted"], t["changed"]) == (3, 1)
-    assert archive_db(directory).execute("select count(*) from deletions where id = 'c'").fetchone() == (0,)  # not left as requested
+    assert archive_db(directory).execute("select outcome from deletions where id = 'c'").fetchall() == [("stayed",)]
 
 
 def test_unsafe_ids_are_never_put_into_the_statement(tmp_path):
@@ -212,7 +247,16 @@ def test_a_failed_vacuum_still_records_and_reports_the_deletes(tmp_path, monkeyp
     assert postgres_ids(tmp_path) == ["bad", "new"]
     t = totals(directory)
     assert (t["deleted"], t["vacuum"]) == (4, "failed")
-    assert archive_db(directory).execute("select count(*) from deletions where deleted_at is not null").fetchone() == (4,)
+    assert archive_db(directory).execute("select count(*) from deletions where outcome = 'deleted'").fetchone() == (4,)
+
+
+def test_a_vacuum_the_server_skips_with_a_warning_is_not_done(tmp_path):
+    config, directory, rows = archived(tmp_path)
+    (tmp_path / "letta.json").write_text(json.dumps({"provider_traces": rows, "__vacuum_warning": True}))
+    code, out = delete(config, directory)
+    assert code == 4 and totals(directory)["vacuum"] == "warning" and "server warning" in out
+    assert "permission denied" not in out  # the server's own text is not passed on
+    assert postgres_ids(tmp_path) == ["bad", "new"]
 
 
 def test_a_crash_right_after_the_delete_leaves_the_rows_marked_requested(tmp_path, monkeypatch):
@@ -228,8 +272,67 @@ def test_a_crash_right_after_the_delete_leaves_the_rows_marked_requested(tmp_pat
         delete(config, directory)
     assert postgres_ids(tmp_path) == ["bad", "c", "d", "new"]  # the first day's batch went
     db = archive_db(directory)
-    assert sorted(db.execute("select id, deleted_at from deletions")) == [("a", None), ("b", None)]  # requested
-    assert db.execute("select finished_at from runs order by run desc limit 1").fetchone() == (None,)
+    crashed = db.execute("select max(run) from runs").fetchone()[0]
+    assert sorted(db.execute("select id, run, outcome from deletions")) == [("a", crashed, None), ("b", crashed, None)]
+    assert db.execute("select finished_at from runs where run = ?", (crashed,)).fetchone() == (None,)
+
+    # A dry run reports them and records nothing
+    monkeypatch.setattr(ta, "_delete_batch", real)
+    code, out = delete(config, directory, dry_run=True)
+    assert "left 2 deletions unanswered; Postgres now: gone 2, still there 0 (dry run" in out
+    assert sorted(db.execute("select id, outcome from deletions")) == [("a", None), ("b", None)]
+
+    # The rerun asks Postgres, records the outcome on the earlier attempt's own rows, and carries on
+    code, out = delete(config, directory)
+    assert code == 0 and "left 2 deletions unanswered; Postgres now: gone 2, still there 0 (recorded)" in out
+    assert sorted(db.execute("select id, run, outcome, resolved_at is not null from deletions where run = ?", (crashed,))) == [
+        ("a", crashed, "gone", 1), ("b", crashed, "gone", 1)]
+    assert totals(directory)["earlier"] == {"unresolved": 2, "gone": 2, "present": 0}
+    assert postgres_ids(tmp_path) == ["bad", "new"]
+    assert db.execute("select count(*) from deletions where outcome is null").fetchone() == (0,)
+
+
+def test_a_stop_before_the_delete_reached_postgres_leaves_present_rows_that_are_deleted_on_the_rerun(tmp_path, monkeypatch):
+    config, directory, _ = archived(tmp_path)
+    real = ta._delete_batch
+
+    def stop_before(config, batch, cutoff):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(ta, "_delete_batch", stop_before)
+    with pytest.raises(KeyboardInterrupt):
+        delete(config, directory)
+    db = archive_db(directory)
+    crashed = db.execute("select max(run) from runs").fetchone()[0]
+    monkeypatch.setattr(ta, "_delete_batch", real)
+    code, out = delete(config, directory)
+    assert code == 0 and "gone 0, still there 2 (recorded)" in out and postgres_ids(tmp_path) == ["bad", "new"]
+    rerun = db.execute("select max(run) from runs").fetchone()[0]
+    assert sorted(db.execute("select id, run, outcome from deletions where id in ('a', 'b')")) == [
+        ("a", crashed, "present"), ("a", rerun, "deleted"), ("b", crashed, "present"), ("b", rerun, "deleted")]
+
+
+def test_if_postgres_cannot_say_what_happened_the_requests_stay_unresolved(tmp_path, monkeypatch):
+    config, directory, _ = archived(tmp_path)
+    real = ta._delete_batch
+
+    def crash_after(config, batch, cutoff):
+        real(config, batch, cutoff)
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(ta, "_delete_batch", crash_after)
+    with pytest.raises(KeyboardInterrupt):
+        delete(config, directory)
+
+    def unreachable(config, ids):
+        raise ta.subprocess.CalledProcessError(2, ["psql"])
+
+    monkeypatch.setattr(ta, "_delete_batch", real)
+    monkeypatch.setattr(ta, "_present_ids", unreachable)
+    with pytest.raises(ta.subprocess.CalledProcessError):
+        delete(config, directory)
+    assert archive_db(directory).execute("select count(*) from deletions where outcome is null").fetchone() == (2,)
+    assert postgres_ids(tmp_path) == ["bad", "c", "d", "new"]  # nothing new was deleted
 
 
 def test_max_rows_defers_the_rest_oldest_first(tmp_path):

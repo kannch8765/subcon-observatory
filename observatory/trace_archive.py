@@ -64,6 +64,26 @@ def parse_exact(text):
     return json.loads(text, object_pairs_hook=_no_duplicate_keys, parse_float=decimal.Decimal, parse_constant=_no_constant)
 
 
+def json_equal(a, b):
+    """The same JSON value, exactly, for two parse_exact results. Stricter than Python's ==, which says True == 1 and
+    ignores key order: booleans are never numbers, numbers compare by exact value (1, 1.0 and 1e0 are the same
+    number), strings by text, arrays item by item, objects by the same keys in the same order. Deep nesting raises
+    RecursionError, as parsing does."""
+    if isinstance(a, bool) or isinstance(b, bool):
+        return isinstance(a, bool) and isinstance(b, bool) and a == b
+    if a is None or b is None:
+        return a is None and b is None
+    if isinstance(a, (int, decimal.Decimal)) and isinstance(b, (int, decimal.Decimal)):
+        return a == b
+    if isinstance(a, str) and isinstance(b, str):
+        return a == b
+    if isinstance(a, list) and isinstance(b, list):
+        return len(a) == len(b) and all(json_equal(x, y) for x, y in zip(a, b))
+    if isinstance(a, dict) and isinstance(b, dict):
+        return list(a) == list(b) and all(json_equal(a[k], b[k]) for k in a)
+    return False
+
+
 def canonical(value):
     """Bytes a message is stored and hashed as. surrogatepass keeps lone surrogates from \\ud83d-style escapes."""
     return json.dumps(value, ensure_ascii=False, separators=(",", ":")).encode("utf-8", "surrogatepass")
@@ -99,7 +119,7 @@ def split_trace(row):
         split = Split("split", {"columns": columns, "request_rest": rest, "request_keys": list(request),
                                 "message_hashes": [h for h, _ in blobs]}, blobs)
         rebuilt = rebuild(split.record, dict(blobs).__getitem__)["request_json"]
-        if parse_exact(canonical(rebuilt).decode("utf-8", "surrogatepass")) != parse_exact(raw):
+        if not json_equal(parse_exact(canonical(rebuilt).decode("utf-8", "surrogatepass")), parse_exact(raw)):
             return whole
         return split
     except (ValueError, RecursionError):
@@ -121,8 +141,7 @@ def rebuild(record, lookup):
 
 
 def verify(row, split, lookup=None):
-    """True when the record rebuilds the row: other columns identical text, request the same JSON value with exact
-    numbers. `lookup` gives message bytes by hash (default: the split's own blobs; the archive passes its reader).
+    """True when the record rebuilds the row: other columns identical text, request the same JSON value (json_equal). `lookup` gives message bytes by hash (default: the split's own blobs; the archive passes its reader).
     Never raises: a row that can't be checked is simply not verified."""
     if split.status == "undecodable":
         return False
@@ -132,7 +151,8 @@ def verify(row, split, lookup=None):
             return False
         if split.status == "whole":
             return rebuilt["request_json"] == row.get("request_json")
-        return parse_exact(canonical(rebuilt["request_json"]).decode("utf-8", "surrogatepass")) == parse_exact(row["request_json"])
+        return json_equal(parse_exact(canonical(rebuilt["request_json"]).decode("utf-8", "surrogatepass")),
+                          parse_exact(row["request_json"]))
     except (ValueError, RecursionError, KeyError):
         return False
 
@@ -275,8 +295,8 @@ create table if not exists traces (id text primary key, day text not null, creat
 create index if not exists traces_day on traces (day, created_at, id);
 create table if not exists runs (run integer primary key, started_at text not null, finished_at text, args text not null,
     totals text);
-create table if not exists deletions (id text primary key, day text not null, run integer not null,
-    requested_at text not null, deleted_at text);
+create table if not exists deletions (id text not null, day text not null, run integer not null,
+    requested_at text not null, outcome text, resolved_at text, primary key (id, run));
 """
 ARCHIVE_STATS = ("rows", "new", "already", "verified", "conflict", "undecodable", "verify_failed", "reread_failed",
                  "added_bytes")
@@ -595,10 +615,43 @@ def _delete_batch(config, batch, cutoff):
 
 
 def _vacuum(config):
-    """Plain VACUUM: new rows reuse the space; the file doesn't shrink (that's VACUUM FULL, which locks the table)."""
+    """Plain VACUUM: new rows reuse the space; the file doesn't shrink (that's VACUUM FULL, which locks the table).
+    "done", or "warning" when the server warned: without the right privilege PG skips the table with a WARNING and
+    still succeeds. The server's text is never passed on."""
     cmd, env = _psql_write(config)
-    subprocess.run([*cmd, "-v", "ON_ERROR_STOP=1", "-c", "vacuum (analyze) provider_traces"], env=env,
-                   capture_output=True, text=True, check=True)
+    result = subprocess.run([*cmd, "-v", "ON_ERROR_STOP=1", "-c", "vacuum (analyze) provider_traces"], env=env,
+                            capture_output=True, text=True, check=True)
+    return "warning" if "WARNING" in result.stderr else "done"
+
+
+def _present_ids(config, ids):
+    """Which of these ids are in provider_traces now (read-only; ids only, never a row)."""
+    present = set()
+    for start in range(0, len(ids), 500):
+        chunk = ids[start:start + 500]
+        if not all(_SAFE_ID.fullmatch(i) for i in chunk):
+            raise RuntimeError("an unresolved deletion has an id that can't go into a statement")
+        cmd, env = _psql(config)
+        out = subprocess.run([*cmd, "-v", "ON_ERROR_STOP=1", "-A", "-t", "-c", "select id from provider_traces where id in ("
+                              + ", ".join(f"'{i}'" for i in chunk) + ")"], env=env, capture_output=True, text=True,
+                             check=True).stdout
+        present.update(line for line in out.splitlines() if line in chunk)
+    return present
+
+
+def resolve_requests(config, db, dry_run):
+    """Deletions an earlier run requested but never heard back about (it stopped between its DELETE and the answer).
+    Postgres says what happened: a row that is gone is `gone`, one still there is `present` (that DELETE didn't
+    happen; the row is checked again like any other). The earlier attempt's row is kept, with the outcome added.
+    Returns {"unresolved", "gone", "present"}; --dry-run records nothing."""
+    pending = db.execute("select id, run from deletions where outcome is null order by run, id").fetchall()
+    present = _present_ids(config, sorted({i for i, _ in pending})) if pending else set()
+    if pending and not dry_run:
+        with db:
+            db.executemany("update deletions set outcome = ?, resolved_at = ? where id = ? and run = ?",
+                           [("present" if i in present else "gone", _now(), i, r) for i, r in pending])
+    gone = sum(i not in present for i, _ in pending)
+    return {"unresolved": len(pending), "gone": gone, "present": len(pending) - gone}
 
 
 def _check_day(config, db, reader, analysed, where, days, budget):
@@ -636,7 +689,8 @@ def run_delete(config, directory, older_than_days=DEFAULT_OLDER_THAN_DAYS, date_
     rebuilt exactly from the archive's bytes. It's then deleted only while it has the md5 it was read with. Deleted ids
     are recorded in the archive's `deletions` table; at the end, plain VACUUM if anything went. --dry-run does every
     check and deletes nothing. Returns 4 when any row failed its re-check (mismatch), changed before its delete or
-    has an id that can't go into the statement (unsafe_id), or when the VACUUM failed; else 0."""
+    has an id that can't go into the statement (unsafe_id), or when the VACUUM failed or warned; else 0. First,
+    deletions an earlier run left unanswered are resolved against Postgres (resolve_requests)."""
     if older_than_days < MIN_DELETE_DAYS:
         raise ValueError(f"--delete keeps at least the last {MIN_DELETE_DAYS} days")
     if batch_rows < 1 or (max_rows is not None and max_rows < 1):
@@ -651,6 +705,7 @@ def run_delete(config, directory, older_than_days=DEFAULT_OLDER_THAN_DAYS, date_
         with db:
             run = db.execute("insert into runs (started_at, args) values (?, ?)",
                              (_now(), f"delete{' --dry-run' if dry_run else ''} {where}")).lastrowid
+        earlier = resolve_requests(config, db, dry_run)  # before anything new is requested
         days, budget = {}, max_rows
         for day, _ in day_counts(config, where):
             # Check the whole day in its read-only transaction, then delete in batches after it has ended. The
@@ -667,43 +722,43 @@ def run_delete(config, directory, older_than_days=DEFAULT_OLDER_THAN_DAYS, date_
                     for _, _, d in batch:
                         days[d]["would_delete"] += 1
                     continue
-                # Requested first, so a crash right after the DELETE leaves rows marked requested (deleted_at null),
-                # never unrecorded; Postgres says which of them went.
+                # Requested first, so a stop right after the DELETE leaves rows requested (outcome null), never
+                # unrecorded; the next run asks Postgres what happened to them (resolve_requests).
                 with db:
-                    db.executemany("insert or replace into deletions values (?, ?, ?, ?, null)",
+                    db.executemany("insert into deletions values (?, ?, ?, ?, null, null)",
                                    [(t, d, run, _now()) for t, _, d in batch])
                 deleted = _delete_batch(config, batch, cutoff)
                 with db:
-                    db.executemany("update deletions set deleted_at = ? where id = ?",
-                                   [(_now(), t) for t, _, _ in batch if t in deleted])
-                    db.executemany("delete from deletions where id = ? and deleted_at is null",
-                                   [(t,) for t, _, _ in batch if t not in deleted])
+                    db.executemany("update deletions set outcome = ?, resolved_at = ? where id = ? and run = ?",
+                                   [("deleted" if t in deleted else "stayed", _now(), t, run) for t, _, _ in batch])
                 for t, _, d in batch:
                     days[d]["deleted" if t in deleted else "changed"] += 1
         totals = {key: sum(d[key] for d in days.values()) for key in DELETE_STATS}
         # The deletes are done: record and report them before VACUUM, so a VACUUM failure can't hide what went.
-        record = {**totals, "vacuum": "pending" if vacuum and totals["deleted"] else "skipped"}
+        record = {**totals, "earlier": earlier, "vacuum": "pending" if vacuum and totals["deleted"] else "not_run"}
         with db:
             db.execute("update runs set finished_at = ?, totals = ? where run = ?", (_now(), json.dumps(record), run))
-        delete_report(days, totals, dry_run, out)
+        delete_report(days, totals, dry_run, out, earlier)
         if record["vacuum"] == "pending":
             try:
-                _vacuum(config)
-                record["vacuum"] = "done"
+                record["vacuum"] = _vacuum(config)
             except subprocess.CalledProcessError:
                 record["vacuum"] = "failed"
             with db:
                 db.execute("update runs set totals = ? where run = ?", (json.dumps(record), run))
-            out.write("VACUUM done: new rows reuse the space; giving it back to the disk needs VACUUM FULL (not done here).\n"
-                      if record["vacuum"] == "done" else "VACUUM failed (the deletes stand): run it again by hand.\n")
-        bad = totals["mismatch"] or totals["changed"] or totals["unsafe_id"] or record["vacuum"] == "failed"
+            out.write({"done": "VACUUM done: new rows reuse the space; giving it back to the disk needs VACUUM FULL "
+                               "(not done here).\n",
+                       "warning": "VACUUM ended with a server warning (e.g. no privilege: the table was skipped). The "
+                                  "deletes stand; check and run it by hand.\n",
+                       "failed": "VACUUM failed (the deletes stand): run it again by hand.\n"}[record["vacuum"]])
+        bad = totals["mismatch"] or totals["changed"] or totals["unsafe_id"] or record["vacuum"] in ("warning", "failed")
         return 4 if bad else 0
     finally:
         db.close()
         lock.close()
 
 
-def delete_report(days, totals, dry_run, out=sys.stdout):
+def delete_report(days, totals, dry_run, out=sys.stdout, earlier=None):
     out.write("day          rows  deleted  would_delete  not_archived  not_analysed  mismatch  changed  unsafe_id  deferred\n")
     for day in sorted(days):
         d = days[day]
@@ -712,6 +767,9 @@ def delete_report(days, totals, dry_run, out=sys.stdout):
     t = totals
     out.write(f"{'total':<10} {t['rows']:6d} {t['deleted']:8d} {t['would_delete']:13d} {t['not_archived']:13d}"
               f" {t['not_analysed']:13d} {t['mismatch']:9d} {t['changed']:8d} {t['unsafe_id']:10d} {t['deferred']:9d}\n")
+    if earlier and earlier["unresolved"]:
+        out.write(f"earlier runs left {earlier['unresolved']} deletions unanswered; Postgres now: gone {earlier['gone']}, "
+                  f"still there {earlier['present']}" + (" (dry run: not recorded)" if dry_run else " (recorded)") + ".\n")
     if dry_run:
         out.write("dry run: nothing deleted.\n")
     if t["mismatch"] or t["changed"]:

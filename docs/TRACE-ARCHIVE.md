@@ -18,8 +18,10 @@ the conversation. The telemetry collector already copies each trace's metrics (s
   ordered list of message hashes.
 - **Fallback:** a request that isn't a JSON object with a `messages` list is kept as its original text.
 
-Requests are compared as **JSON values**, not bytes. Whitespace and number spelling may differ; keys, their order,
-strings and numbers' values don't. Numbers are compared exactly (as decimals), so a value a float can't hold, like
+Requests are compared as **JSON values**, not bytes (`json_equal`, the one comparison used when splitting, verifying
+and deleting). Whitespace and number spelling may differ (`1`, `1.0` and `1e0` are the same number); keys, their order,
+strings, numbers' values and types don't: `true` is never `1`, `null` is never `0`, `{}` is never `[]`. Python's own
+`==` can't be used for this (it says `True == 1` and ignores key order). Numbers are compared exactly (as decimals), so a value a float can't hold, like
 `1e400` or a 20-digit fraction, is never "rebuilt" as a nearby float. A request that can't be split and rebuilt exactly
 is kept as text instead: a duplicated object key (parsing would drop one), such a number, `NaN`/`Infinity`, or nesting
 too deep to parse.
@@ -59,7 +61,7 @@ One SQLite file, `provider_traces.sqlite3`, in a directory that must belong to t
 | `traces` | `id`, `day` (server time zone), `created_at`, `status` (`split` / `whole`), `record_sha256`, `record_z`, `archived_at`, `verified_at` |
 | `meta` | `format` = 1 |
 | `runs` | when each `--archive` / `--delete` run started and finished, its range, and its counts |
-| `deletions` | `id`, `day`, `run`, `requested_at`, `deleted_at`: rows `--delete` removed from Postgres; `deleted_at` empty = requested, and the run stopped before Postgres answered (added in step 3; older archives get the table on their next run) |
+| `deletions` | one row per row and `--delete` run that asked for it: `id`, `day`, `run`, `requested_at`, `outcome`, `resolved_at`. `outcome` is `deleted` / `stayed` (Postgres's answer), `gone` / `present` (what a later run found for a request that never got an answer), or empty while unanswered (added in step 3; older archives get the table on their next run) |
 
 `--archive` works one day at a time, oldest first, each day in its own read-only Postgres transaction (open while that
 day is read and archived, so one snapshot per day, never one for the whole range):
@@ -110,9 +112,15 @@ same JSON value, not the same bytes (whitespace and number spelling may differ, 
    v.md5 and t.created_at < <cutoff> returning t.id`. A row that changed after its check no longer has that md5 and
    stays (`changed`). Ids go into the statement as literals, so only ids of a plain shape (letters, digits, `_.:-`)
    are ever sent; any other row stays (`unsafe_id`).
-4. Each batch is written to the archive's `deletions` table as requested before its DELETE, and completed
-   (`deleted_at`) or dropped (the row stayed) after Postgres answers. A crash in between leaves `requested` rows, never
-   unrecorded deletes: Postgres says which of them went.
+4. Each batch is written to the archive's `deletions` table as requested (no `outcome`) before its DELETE, and gets
+   its outcome after Postgres answers: `deleted`, or `stayed` (changed since its check). A stop in between leaves
+   unanswered requests, never unrecorded deletes.
+
+Every run starts by resolving the requests earlier runs left unanswered: it asks Postgres which of those ids are still
+there (ids only) and records `gone` or `present` on the earlier attempt's own rows, so that attempt stays in the
+journal. A `present` row is then checked like any other and may be deleted in this run (a new journal row). The report
+says how many there were and what Postgres said; a dry run reports them and records nothing. If Postgres can't be
+asked, the run stops before deleting anything and the requests stay unanswered.
 
 At the end, if anything was deleted, plain `VACUUM (ANALYZE) provider_traces`: it doesn't lock out reads or writes, and
 new traces reuse the space. The run's counts are recorded and printed before the VACUUM, so a VACUUM failure can't
@@ -120,7 +128,9 @@ hide what was deleted. `--dry-run` makes every check and deletes nothing (it sti
 (the oldest first) and counts the rest as `deferred`; `--no-vacuum` skips the VACUUM. Per day it prints rows, deleted
 (or would_delete), not_archived, not_analysed, mismatch (the archive no longer rebuilds the row), changed, unsafe_id and
 deferred. Exit codes: 0 all good; 4 at least one `mismatch`, `changed` or `unsafe_id` row (they stay; `--archive`
-shows what differs), or the VACUUM failed (the deletes stand). A row that fails its re-check keeps its `verified_at`
+shows what differs), or the VACUUM failed or ended with a server warning (the deletes stand; without the right
+privilege PG skips the table with a WARNING and still succeeds; the server's text isn't passed on). A row that fails
+its re-check keeps its `verified_at`
 here: the next `--archive` run marks it.
 
 **After a delete the archive holds the only copy of those rows.** Keep a second copy of the archive file somewhere
