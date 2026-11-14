@@ -601,6 +601,34 @@ def _vacuum(config):
                    capture_output=True, text=True, check=True)
 
 
+def _check_day(config, db, reader, analysed, where, days, budget):
+    """Read one day's rows (one read-only transaction, each row with its md5) and check each: verified in the archive,
+    analysed by telemetry, rebuilt exactly from the archive's bytes. Returns ([(id, md5, day)] that passed, budget left
+    for --max-rows); counts the rest in `days`."""
+    eligible = []
+    for row, digest in _stream(config, where, with_md5=True):
+        day = trace_day(row.get("created_at"))
+        stats = days.setdefault(day, dict.fromkeys(DELETE_STATS, 0))
+        stats["rows"] += 1
+        trace_id = row["id"]
+        if not _SAFE_ID.match(trace_id) or not _MD5.match(digest or ""):
+            stats["unsafe_id"] += 1
+            continue
+        got = db.execute("select verified_at from traces where id = ?", (trace_id,)).fetchone()
+        if not got or not got[0]:
+            stats["not_archived"] += 1
+        elif trace_hash(trace_id) not in analysed:
+            stats["not_analysed"] += 1
+        elif not verify_archived(reader, row):
+            stats["mismatch"] += 1
+        elif budget is not None and budget <= 0:
+            stats["deferred"] += 1
+        else:
+            eligible.append((trace_id, digest, day))
+            budget = None if budget is None else budget - 1
+    return eligible, budget
+
+
 def run_delete(config, directory, older_than_days=DEFAULT_OLDER_THAN_DAYS, date_from=None, date_to=None,
                batch_rows=DEFAULT_BATCH_ROWS, max_rows=None, dry_run=False, vacuum=True, now=None, out=sys.stdout):
     """Delete old rows that are in the archive and analysed, day by day, oldest first. Right before its delete, each
@@ -619,34 +647,20 @@ def run_delete(config, directory, older_than_days=DEFAULT_OLDER_THAN_DAYS, date_
     where, cutoff = where_clause(older_than_days, date_from, date_to, now=now), cutoff_time(older_than_days, now)
     analysed = analysed_traces(config)
     db, path, lock = open_archive(directory)
-    reader = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
     try:
         with db:
             run = db.execute("insert into runs (started_at, args) values (?, ?)",
                              (_now(), f"delete{' --dry-run' if dry_run else ''} {where}")).lastrowid
         days, budget = {}, max_rows
         for day, _ in day_counts(config, where):
-            # Check the whole day in its read-only transaction, then delete in batches after it has ended.
-            eligible = []
-            for row, digest in _stream(config, where_clause(older_than_days, day, day, now=now), with_md5=True):
-                stats = days.setdefault(trace_day(row.get("created_at")), dict.fromkeys(DELETE_STATS, 0))
-                stats["rows"] += 1
-                trace_id = row["id"]
-                if not _SAFE_ID.match(trace_id) or not _MD5.match(digest or ""):
-                    stats["unsafe_id"] += 1
-                    continue
-                got = db.execute("select verified_at from traces where id = ?", (trace_id,)).fetchone()
-                if not got or not got[0]:
-                    stats["not_archived"] += 1
-                elif trace_hash(trace_id) not in analysed:
-                    stats["not_analysed"] += 1
-                elif not verify_archived(reader, row):
-                    stats["mismatch"] += 1
-                elif budget is not None and budget <= 0:
-                    stats["deferred"] += 1
-                else:
-                    eligible.append((trace_id, digest, trace_day(row.get("created_at"))))
-                    budget = None if budget is None else budget - 1
+            # Check the whole day in its read-only transaction, then delete in batches after it has ended. The
+            # archive's reader is closed before `deletions` is written, as in _flush.
+            reader = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+            try:
+                eligible, budget = _check_day(config, db, reader, analysed,
+                                              where_clause(older_than_days, day, day, now=now), days, budget)
+            finally:
+                reader.close()
             for start in range(0, len(eligible), batch_rows):
                 batch = eligible[start:start + batch_rows]
                 if dry_run:
@@ -669,7 +683,6 @@ def run_delete(config, directory, older_than_days=DEFAULT_OLDER_THAN_DAYS, date_
         delete_report(days, totals, dry_run, vacuumed, out)
         return 4 if totals["mismatch"] or totals["changed"] else 0
     finally:
-        reader.close()
         db.close()
         lock.close()
 
