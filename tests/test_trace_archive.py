@@ -147,3 +147,18 @@ def test_deeply_nested_request_is_kept_verbatim_and_does_not_stop_the_scan():
     assert split.status == "whole" and ta.verify(rows[1], split)
     days, totals = ta.plan(rows)
     assert (totals["rows"], totals["split"], totals["whole"], totals["verify_failed"]) == (3, 2, 1, 0)
+
+
+def test_split_check_uses_the_exact_json_comparison(monkeypatch):
+    # A rebuild that turned `true` into `1` must not count as lossless (Python's == says True == 1)
+    real = ta.rebuild
+
+    def flip(record, lookup):
+        rebuilt = real(record, lookup)
+        if isinstance(rebuilt["request_json"], dict) and rebuilt["request_json"].get("stream") is True:
+            rebuilt["request_json"]["stream"] = 1
+        return rebuilt
+
+    monkeypatch.setattr(ta, "rebuild", flip)
+    assert ta.split_trace(row("t", request({"role": "user", "content": "x"}, stream=True))).status == "whole"
+    assert ta.split_trace(row("t", request({"role": "user", "content": "x"}, stream=False))).status == "split"
