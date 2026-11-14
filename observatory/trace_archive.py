@@ -275,8 +275,8 @@ create table if not exists traces (id text primary key, day text not null, creat
 create index if not exists traces_day on traces (day, created_at, id);
 create table if not exists runs (run integer primary key, started_at text not null, finished_at text, args text not null,
     totals text);
-create table if not exists deletions (id text primary key, day text not null, deleted_at text not null,
-    run integer not null);
+create table if not exists deletions (id text primary key, day text not null, run integer not null,
+    requested_at text not null, deleted_at text);
 """
 ARCHIVE_STATS = ("rows", "new", "already", "verified", "conflict", "undecodable", "verify_failed", "reread_failed",
                  "added_bytes")
@@ -556,8 +556,8 @@ DEFAULT_BATCH_ROWS = 50
 DELETE_STATS = ("rows", "deleted", "would_delete", "not_archived", "not_analysed", "mismatch", "changed", "unsafe_id",
                 "deferred")
 # Ids and digests go into the DELETE statement as literals, so only these shapes are ever sent; any other id is skipped.
-_SAFE_ID = re.compile(r"^[A-Za-z0-9_.:-]{1,200}$")
-_MD5 = re.compile(r"^[0-9a-f]{32}$")
+_SAFE_ID = re.compile(r"[A-Za-z0-9_.:-]{1,200}")  # used with fullmatch: no trailing newline slips through
+_MD5 = re.compile(r"[0-9a-f]{32}")
 
 
 def analysed_traces(config):
@@ -611,7 +611,7 @@ def _check_day(config, db, reader, analysed, where, days, budget):
         stats = days.setdefault(day, dict.fromkeys(DELETE_STATS, 0))
         stats["rows"] += 1
         trace_id = row["id"]
-        if not _SAFE_ID.match(trace_id) or not _MD5.match(digest or ""):
+        if not _SAFE_ID.fullmatch(trace_id) or not _MD5.fullmatch(digest or ""):
             stats["unsafe_id"] += 1
             continue
         got = db.execute("select verified_at from traces where id = ?", (trace_id,)).fetchone()
@@ -635,8 +635,8 @@ def run_delete(config, directory, older_than_days=DEFAULT_OLDER_THAN_DAYS, date_
     row is read again from Postgres and must be verified in the archive, have its hashed id in telemetry, and still be
     rebuilt exactly from the archive's bytes. It's then deleted only while it has the md5 it was read with. Deleted ids
     are recorded in the archive's `deletions` table; at the end, plain VACUUM if anything went. --dry-run does every
-    check and deletes nothing. Returns 4 when any row failed its re-check (mismatch) or changed before its delete,
-    else 0."""
+    check and deletes nothing. Returns 4 when any row failed its re-check (mismatch), changed before its delete or
+    has an id that can't go into the statement (unsafe_id), or when the VACUUM failed; else 0."""
     if older_than_days < MIN_DELETE_DAYS:
         raise ValueError(f"--delete keeps at least the last {MIN_DELETE_DAYS} days")
     if batch_rows < 1 or (max_rows is not None and max_rows < 1):
@@ -667,27 +667,43 @@ def run_delete(config, directory, older_than_days=DEFAULT_OLDER_THAN_DAYS, date_
                     for _, _, d in batch:
                         days[d]["would_delete"] += 1
                     continue
-                deleted, deleted_at = _delete_batch(config, batch, cutoff), _now()
+                # Requested first, so a crash right after the DELETE leaves rows marked requested (deleted_at null),
+                # never unrecorded; Postgres says which of them went.
                 with db:
-                    db.executemany("insert or replace into deletions values (?, ?, ?, ?)",
-                                   [(t, d, deleted_at, run) for t, _, d in batch if t in deleted])
+                    db.executemany("insert or replace into deletions values (?, ?, ?, ?, null)",
+                                   [(t, d, run, _now()) for t, _, d in batch])
+                deleted = _delete_batch(config, batch, cutoff)
+                with db:
+                    db.executemany("update deletions set deleted_at = ? where id = ?",
+                                   [(_now(), t) for t, _, _ in batch if t in deleted])
+                    db.executemany("delete from deletions where id = ? and deleted_at is null",
+                                   [(t,) for t, _, _ in batch if t not in deleted])
                 for t, _, d in batch:
                     days[d]["deleted" if t in deleted else "changed"] += 1
         totals = {key: sum(d[key] for d in days.values()) for key in DELETE_STATS}
-        vacuumed = bool(vacuum and totals["deleted"])
-        if vacuumed:
-            _vacuum(config)
+        # The deletes are done: record and report them before VACUUM, so a VACUUM failure can't hide what went.
+        record = {**totals, "vacuum": "pending" if vacuum and totals["deleted"] else "skipped"}
         with db:
-            db.execute("update runs set finished_at = ?, totals = ? where run = ?",
-                       (_now(), json.dumps({**totals, "vacuumed": vacuumed}), run))
-        delete_report(days, totals, dry_run, vacuumed, out)
-        return 4 if totals["mismatch"] or totals["changed"] else 0
+            db.execute("update runs set finished_at = ?, totals = ? where run = ?", (_now(), json.dumps(record), run))
+        delete_report(days, totals, dry_run, out)
+        if record["vacuum"] == "pending":
+            try:
+                _vacuum(config)
+                record["vacuum"] = "done"
+            except subprocess.CalledProcessError:
+                record["vacuum"] = "failed"
+            with db:
+                db.execute("update runs set totals = ? where run = ?", (json.dumps(record), run))
+            out.write("VACUUM done: new rows reuse the space; giving it back to the disk needs VACUUM FULL (not done here).\n"
+                      if record["vacuum"] == "done" else "VACUUM failed (the deletes stand): run it again by hand.\n")
+        bad = totals["mismatch"] or totals["changed"] or totals["unsafe_id"] or record["vacuum"] == "failed"
+        return 4 if bad else 0
     finally:
         db.close()
         lock.close()
 
 
-def delete_report(days, totals, dry_run, vacuumed, out=sys.stdout):
+def delete_report(days, totals, dry_run, out=sys.stdout):
     out.write("day          rows  deleted  would_delete  not_archived  not_analysed  mismatch  changed  unsafe_id  deferred\n")
     for day in sorted(days):
         d = days[day]
@@ -698,10 +714,10 @@ def delete_report(days, totals, dry_run, vacuumed, out=sys.stdout):
               f" {t['not_analysed']:13d} {t['mismatch']:9d} {t['changed']:8d} {t['unsafe_id']:10d} {t['deferred']:9d}\n")
     if dry_run:
         out.write("dry run: nothing deleted.\n")
-    elif vacuumed:
-        out.write("VACUUM done: new rows reuse the space; giving it back to the disk needs VACUUM FULL (not done here).\n")
     if t["mismatch"] or t["changed"]:
         out.write("mismatch / changed rows stay in Postgres: run --archive to see what differs.\n")
+    if t["unsafe_id"]:
+        out.write("unsafe_id rows stay in Postgres: their ids can't go into the statement; look at them by hand.\n")
 
 
 def main():

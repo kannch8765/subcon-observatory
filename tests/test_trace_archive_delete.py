@@ -69,11 +69,13 @@ def test_delete_removes_exactly_the_archived_analysed_old_rows_then_vacuums(tmp_
     assert code == 0 and "VACUUM done" in out
     assert postgres_ids(tmp_path) == ["bad", "new"]  # unarchivable and inside-the-window rows stay
     t = totals(directory)
-    assert (t["deleted"], t["not_archived"], t["mismatch"], t["changed"], t["vacuumed"]) == (4, 1, 0, 0, True)
+    assert (t["deleted"], t["not_archived"], t["mismatch"], t["changed"], t["vacuum"]) == (4, 1, 0, 0, "done")
     db = archive_db(directory)
     run_id = db.execute("select max(run) from runs").fetchone()[0]
-    assert sorted(db.execute("select id, day, run from deletions")) == [
-        ("a", "2026-08-08", run_id), ("b", "2026-08-08", run_id), ("c", "2026-08-09", run_id), ("d", "2026-08-09", run_id)]
+    assert sorted(db.execute("select id, day, run, requested_at is not null, deleted_at is not null from deletions")) == [
+        ("a", "2026-08-08", run_id, 1, 1), ("b", "2026-08-08", run_id, 1, 1), ("c", "2026-08-09", run_id, 1, 1),
+        ("d", "2026-08-09", run_id, 1, 1)]
+    assert db.execute("select finished_at is not null from runs where run = ?", (run_id,)).fetchone() == (1,)
     assert len(queries(tmp_path, "vacuum")) == 1
     # The DELETE statement itself re-checks each row's md5 and the cutoff
     sql = queries(tmp_path, "delete")[0]
@@ -85,7 +87,7 @@ def test_second_run_finds_nothing_left_and_does_not_vacuum(tmp_path):
     delete(config, directory)
     code, _ = delete(config, directory)
     t = totals(directory)
-    assert code == 0 and (t["rows"], t["deleted"], t["not_archived"], t["vacuumed"]) == (1, 0, 1, False)
+    assert code == 0 and (t["rows"], t["deleted"], t["not_archived"], t["vacuum"]) == (1, 0, 1, "skipped")
     assert len(queries(tmp_path, "vacuum")) == 1
 
 
@@ -168,15 +170,65 @@ def test_row_changed_between_check_and_delete_stays(tmp_path, monkeypatch):
     assert code == 4 and postgres_ids(tmp_path) == ["bad", "c", "new"]
     t = totals(directory)
     assert (t["deleted"], t["changed"]) == (3, 1)
-    assert archive_db(directory).execute("select count(*) from deletions where id = 'c'").fetchone() == (0,)
+    assert archive_db(directory).execute("select count(*) from deletions where id = 'c'").fetchone() == (0,)  # not left as requested
 
 
 def test_unsafe_ids_are_never_put_into_the_statement(tmp_path):
     rows = [*fixture_rows(), row("q'1", request(SHARED), created_at="2026-08-08 12:00:00+09")]
     config, directory, _ = archived(tmp_path, rows, analysed=("a", "b", "c", "d", "q'1"))
-    code, _ = delete(config, directory)
-    assert code == 0 and "q'1" in postgres_ids(tmp_path) and totals(directory)["unsafe_id"] == 1
-    assert all("q'1" not in q for q in queries(tmp_path, "delete"))
+    code, out = delete(config, directory)
+    assert code == 4 and "q'1" in postgres_ids(tmp_path) and totals(directory)["unsafe_id"] == 1  # a timer must notice
+    assert "unsafe_id rows stay" in out and all("q'1" not in q for q in queries(tmp_path, "delete"))
+    assert postgres_ids(tmp_path) == ["bad", "new", "q'1"]
+
+
+def test_id_and_md5_shapes_are_matched_whole():
+    for bad in ("q1\n", "a b", "x'y", "", "a" * 201):
+        assert not ta._SAFE_ID.fullmatch(bad)
+    assert ta._SAFE_ID.fullmatch("provider_trace-0b1c2d3e-aaaa-4bbb-8ccc-0123456789ab")
+    assert not ta._MD5.fullmatch("0" * 32 + "\n") and ta._MD5.fullmatch("0" * 32)
+
+
+def test_the_delete_statement_itself_keeps_rows_inside_the_window(tmp_path):
+    config, directory, _ = archived(tmp_path)
+    md5 = {r["id"]: d for r, d in ta._stream(config, "where created_at < '2030-01-01'", with_md5=True)}
+    deleted = ta._delete_batch(config, [("new", md5["new"], "2026-11-01"), ("a", md5["a"], "2026-08-08")],
+                               ta.cutoff_time(30, NOW))
+    assert deleted == {"a"} and "new" in postgres_ids(tmp_path)
+    assert ta._delete_batch(config, [("b", "0" * 32, "2026-08-08")], ta.cutoff_time(30, NOW)) == set()  # wrong md5
+    assert "b" in postgres_ids(tmp_path)
+
+
+def test_a_failed_vacuum_still_records_and_reports_the_deletes(tmp_path, monkeypatch):
+    config, directory, _ = archived(tmp_path)
+
+    def broken(config):
+        raise ta.subprocess.CalledProcessError(1, ["psql"])
+
+    monkeypatch.setattr(ta, "_vacuum", broken)
+    code, out = delete(config, directory)
+    assert code == 4 and "VACUUM failed" in out and "total" in out
+    assert postgres_ids(tmp_path) == ["bad", "new"]
+    t = totals(directory)
+    assert (t["deleted"], t["vacuum"]) == (4, "failed")
+    assert archive_db(directory).execute("select count(*) from deletions where deleted_at is not null").fetchone() == (4,)
+
+
+def test_a_crash_right_after_the_delete_leaves_the_rows_marked_requested(tmp_path, monkeypatch):
+    config, directory, _ = archived(tmp_path)
+    real = ta._delete_batch
+
+    def crash_after(config, batch, cutoff):
+        real(config, batch, cutoff)
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(ta, "_delete_batch", crash_after)
+    with pytest.raises(KeyboardInterrupt):
+        delete(config, directory)
+    assert postgres_ids(tmp_path) == ["bad", "c", "d", "new"]  # the first day's batch went
+    db = archive_db(directory)
+    assert sorted(db.execute("select id, deleted_at from deletions")) == [("a", None), ("b", None)]  # requested
+    assert db.execute("select finished_at from runs order by run desc limit 1").fetchone() == (None,)
 
 
 def test_max_rows_defers_the_rest_oldest_first(tmp_path):

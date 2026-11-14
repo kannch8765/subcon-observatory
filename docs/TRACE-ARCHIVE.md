@@ -59,7 +59,7 @@ One SQLite file, `provider_traces.sqlite3`, in a directory that must belong to t
 | `traces` | `id`, `day` (server time zone), `created_at`, `status` (`split` / `whole`), `record_sha256`, `record_z`, `archived_at`, `verified_at` |
 | `meta` | `format` = 1 |
 | `runs` | when each `--archive` / `--delete` run started and finished, its range, and its counts |
-| `deletions` | `id`, `day`, `deleted_at`, `run`: rows `--delete` removed from Postgres (added in step 3; older archives get the table on their next run) |
+| `deletions` | `id`, `day`, `run`, `requested_at`, `deleted_at`: rows `--delete` removed from Postgres; `deleted_at` empty = requested, and the run stopped before Postgres answered (added in step 3; older archives get the table on their next run) |
 
 `--archive` works one day at a time, oldest first, each day in its own read-only Postgres transaction (open while that
 day is read and archived, so one snapshot per day, never one for the whole range):
@@ -110,14 +110,21 @@ same JSON value, not the same bytes (whitespace and number spelling may differ, 
    v.md5 and t.created_at < <cutoff> returning t.id`. A row that changed after its check no longer has that md5 and
    stays (`changed`). Ids go into the statement as literals, so only ids of a plain shape (letters, digits, `_.:-`)
    are ever sent; any other row stays (`unsafe_id`).
-4. Record each deleted id in the archive's `deletions` table (id, day, deleted_at, run).
+4. Each batch is written to the archive's `deletions` table as requested before its DELETE, and completed
+   (`deleted_at`) or dropped (the row stayed) after Postgres answers. A crash in between leaves `requested` rows, never
+   unrecorded deletes: Postgres says which of them went.
 
 At the end, if anything was deleted, plain `VACUUM (ANALYZE) provider_traces`: it doesn't lock out reads or writes, and
-new traces reuse the space. `--dry-run` makes every check and deletes nothing; `--max-rows N` deletes at most N rows
+new traces reuse the space. The run's counts are recorded and printed before the VACUUM, so a VACUUM failure can't
+hide what was deleted. `--dry-run` makes every check and deletes nothing (it still records the run); `--max-rows N` deletes at most N rows
 (the oldest first) and counts the rest as `deferred`; `--no-vacuum` skips the VACUUM. Per day it prints rows, deleted
 (or would_delete), not_archived, not_analysed, mismatch (the archive no longer rebuilds the row), changed, unsafe_id and
-deferred. Exit codes: 0 all good; 4 at least one `mismatch` or `changed` (those rows stay; `--archive` shows what
-differs). A row that fails its re-check keeps its `verified_at` here: the next `--archive` run marks it.
+deferred. Exit codes: 0 all good; 4 at least one `mismatch`, `changed` or `unsafe_id` row (they stay; `--archive`
+shows what differs), or the VACUUM failed (the deletes stand). A row that fails its re-check keeps its `verified_at`
+here: the next `--archive` run marks it.
+
+**After a delete the archive holds the only copy of those rows.** Keep a second copy of the archive file somewhere
+else before the first real delete (where is the owner's decision: it holds conversation content), and after each one.
 
 Deleted rows stay restorable: `--restore-day` reads only the archive. Letta only writes `provider_traces` while it runs;
 it reads them back only in its debug API (a step's trace), which answers "not found" for deleted rows.
