@@ -174,12 +174,13 @@ def test_row_changed_between_check_and_delete_stays(tmp_path, monkeypatch):
 
 
 def test_unsafe_ids_are_never_put_into_the_statement(tmp_path):
-    rows = [*fixture_rows(), row("q'1", request(SHARED), created_at="2026-08-08 12:00:00+09")]
-    config, directory, _ = archived(tmp_path, rows, analysed=("a", "b", "c", "d", "q'1"))
+    rows = [*fixture_rows(), row("q'1", request(SHARED), created_at="2026-08-08 12:00:00+09"),
+            row("q2\n", request(SHARED), created_at="2026-08-08 13:00:00+09")]  # `$` alone would let this one through
+    config, directory, _ = archived(tmp_path, rows, analysed=("a", "b", "c", "d", "q'1", "q2\n"))
     code, out = delete(config, directory)
-    assert code == 4 and "q'1" in postgres_ids(tmp_path) and totals(directory)["unsafe_id"] == 1  # a timer must notice
-    assert "unsafe_id rows stay" in out and all("q'1" not in q for q in queries(tmp_path, "delete"))
-    assert postgres_ids(tmp_path) == ["bad", "new", "q'1"]
+    assert code == 4 and totals(directory)["unsafe_id"] == 2  # a timer must notice
+    assert "unsafe_id rows stay" in out and all("q'1" not in q and "q2" not in q for q in queries(tmp_path, "delete"))
+    assert postgres_ids(tmp_path) == ["bad", "new", "q'1", "q2\n"]
 
 
 def test_id_and_md5_shapes_are_matched_whole():
