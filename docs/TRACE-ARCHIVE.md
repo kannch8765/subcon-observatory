@@ -32,7 +32,8 @@ too deep to parse.
 4. rebuilding it from the archive gives the same row: every other column the same text, the request the same JSON value.
 
 So the routine order is **analyse → archive → verify → delete**. A row that can't be read exactly (bytes that aren't
-UTF-8), that fails to rebuild, or that the collector hasn't seen is never deleted; `--plan` and `--archive` count them.
+UTF-8), that fails to rebuild, or that the collector hasn't seen is never deleted; `--plan`, `--archive` and `--delete`
+count them.
 
 ## Steps
 
@@ -43,9 +44,9 @@ UTF-8), that fails to rebuild, or that the collector hasn't seen is never delete
 | 3 | `--delete`: delete verified rows that telemetry has analysed, in small batches, re-checking each against Postgres first, then `VACUUM` | Postgres |
 | 4 | daily timer: steps 2 and 3 for the day that just left the window | both |
 
-Steps 1 and 2 are in this version. Each later step is its own change and needs the owner's go. After step 3, plain `VACUUM` lets
-new traces reuse the space, so the table stops growing; giving the space back to the disk needs `VACUUM FULL`, which locks
-the table for the rewrite and is a separate decision.
+Steps 1 to 3 are in this version. Step 4 is its own change and needs the owner's go, and so does every real
+`--delete` run. After step 3, plain `VACUUM` lets new traces reuse the space, so the table stops growing; giving the
+space back to the disk needs `VACUUM FULL`, which locks the table for the rewrite and is a separate decision.
 
 ## Archive file (step 2)
 
@@ -57,7 +58,8 @@ One SQLite file, `provider_traces.sqlite3`, in a directory that must belong to t
 | `messages` | `hash` (sha256 of the canonical bytes), `z` (those bytes, zlib) |
 | `traces` | `id`, `day` (server time zone), `created_at`, `status` (`split` / `whole`), `record_sha256`, `record_z`, `archived_at`, `verified_at` |
 | `meta` | `format` = 1 |
-| `runs` | when each `--archive` run started and finished, its range, and its counts |
+| `runs` | when each `--archive` / `--delete` run started and finished, its range, and its counts |
+| `deletions` | `id`, `day`, `deleted_at`, `run`: rows `--delete` removed from Postgres (added in step 3; older archives get the table on their next run) |
 
 `--archive` works one day at a time, oldest first, each day in its own read-only Postgres transaction (open while that
 day is read and archived, so one snapshot per day, never one for the whole range):
@@ -91,11 +93,40 @@ csv, header match)` that loads it. Hashes are checked on the way out: after a de
 compare with, and so are the lookup columns. A day without verified rows writes no file. The restored request is the
 same JSON value, not the same bytes (whitespace and number spelling may differ, as above); lone surrogates from `\ud83d`-style escapes are written as escapes again, so the file is valid UTF-8.
 
+## Delete (step 3)
+
+`--delete` is the only mode that writes to Postgres. It refuses `--older-than-days` under 30, needs the archive (run
+`--archive` first) and `TELEMETRY_DIR` in the config, and takes the archive's lock, so it never runs next to an
+`--archive` run. Day by day, oldest first:
+
+1. Read the day's rows in one read-only transaction, each with Postgres's own `md5(row::text)`.
+2. Check each row again, right now, against all four conditions above: it is older than the cutoff (the query), it is
+   verified in the archive, its hashed id is in telemetry's `letta_traces` (`observatory.remote._sanitize.h`, the
+   collector's own hash), and the archive's bytes still rebuild it (`verify_archived`, the same check `--archive`
+   makes, with every hash checked).
+3. After that transaction has ended, delete the rows that passed, `--batch-rows` (default 50) per statement, each
+   statement its own short transaction:
+   `delete from provider_traces t using (values (id, md5), ...) as v(id, md5) where t.id = v.id and md5(t::text) =
+   v.md5 and t.created_at < <cutoff> returning t.id`. A row that changed after its check no longer has that md5 and
+   stays (`changed`). Ids go into the statement as literals, so only ids of a plain shape (letters, digits, `_.:-`)
+   are ever sent; any other row stays (`unsafe_id`).
+4. Record each deleted id in the archive's `deletions` table (id, day, deleted_at, run).
+
+At the end, if anything was deleted, plain `VACUUM (ANALYZE) provider_traces`: it doesn't lock out reads or writes, and
+new traces reuse the space. `--dry-run` makes every check and deletes nothing; `--max-rows N` deletes at most N rows
+(the oldest first) and counts the rest as `deferred`; `--no-vacuum` skips the VACUUM. Per day it prints rows, deleted
+(or would_delete), not_archived, not_analysed, mismatch (the archive no longer rebuilds the row), changed, unsafe_id and
+deferred. Exit codes: 0 all good; 4 at least one `mismatch` or `changed` (those rows stay; `--archive` shows what
+differs). A row that fails its re-check keeps its `verified_at` here: the next `--archive` run marks it.
+
+Deleted rows stay restorable: `--restore-day` reads only the archive. Letta only writes `provider_traces` while it runs;
+it reads them back only in its debug API (a step's trace), which answers "not found" for deleted rows.
+
 ## Privacy
 
 The archive still holds conversation content, so it lives outside the Letta database with root-only permissions, and no
-part of it leaves the server. `--plan` and `--archive` print counts and sizes only; `--restore-day` writes content
-to a root-only file on the server and prints only a row count.
+part of it leaves the server. `--plan`, `--archive` and `--delete` print counts and sizes only; `--restore-day`
+writes content to a root-only file on the server and prints only a row count.
 
 ## Running
 
@@ -104,8 +135,10 @@ python3 -E -s -m observatory.trace_archive --config <file> --plan
 python3 -E -s -m observatory.trace_archive --config <file> --plan --from 2026-08-08 --to 2026-08-08   # one day
 python3 -E -s -m observatory.trace_archive --config <file> --archive --archive-dir /var/lib/subcon-trace-archive
 python3 -E -s -m observatory.trace_archive --restore-day 2026-08-08 --archive-dir /var/lib/subcon-trace-archive --out <file>
+python3 -E -s -m observatory.trace_archive --config <file> --delete --archive-dir /var/lib/subcon-trace-archive --dry-run
+python3 -E -s -m observatory.trace_archive --config <file> --delete --archive-dir /var/lib/subcon-trace-archive --max-rows 100
 ```
 
 It uses the same `LETTA_PSQL` / `LETTA_PG_ARGS` / `LETTA_PG_LIBDIR` settings as the exporters, in a read-only
-transaction. Run it at low priority (`nice -n 19 ionice -c3`); a full plan or first archive parses every old request
-once.
+transaction; only `--delete`'s DELETE and VACUUM statements run in a session that may write. Run it at low priority
+(`nice -n 19 ionice -c3`); a full plan, a first archive or a full delete parses every old request once.

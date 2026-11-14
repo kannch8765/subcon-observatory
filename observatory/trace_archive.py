@@ -4,6 +4,7 @@
     python3 -E -s -m observatory.trace_archive --config <file> --plan --from 2026-08-08 --to 2026-08-09
     python3 -E -s -m observatory.trace_archive --config <file> --archive --archive-dir <dir>   # write + verify
     python3 -E -s -m observatory.trace_archive --restore-day 2026-08-08 --archive-dir <dir> --out <file.csv>
+    python3 -E -s -m observatory.trace_archive --config <file> --delete --archive-dir <dir> --dry-run   # what would go
 
 Every LLM request repeats the whole conversation so far, so the same messages are stored again on every step.
 The archive keeps each distinct message once (keyed by sha256) and, per trace, a record of every other column plus
@@ -13,14 +14,16 @@ JSON value it had (see docs/TRACE-ARCHIVE.md).
 --plan reads Postgres read-only, writes nothing anywhere, and prints per day how many rows would be archived, how
 much they take raw, how much the archive would add, and whether every row rebuilds. --archive writes the archive (a
 SQLite file in a directory only its owner can enter), re-reads every row from disk and marks it verified only if it
-rebuilds the Postgres row. --restore-day writes verified rows back out as CSV that psql's \\copy loads. Nothing here
-deletes from or writes to Postgres. JSON is parsed here, not in Postgres: broken surrogates in stored payloads make
-PG's json functions fail.
+rebuilds the Postgres row. --restore-day writes verified rows back out as CSV that psql's \\copy loads. --delete is
+the only mode that writes to Postgres: it deletes old rows that are verified in the archive and analysed by the
+telemetry collector, each re-checked against both right before its delete. JSON is parsed here, not in Postgres:
+broken surrogates in stored payloads make PG's json functions fail.
 """
 import argparse, csv, datetime, decimal, fcntl, hashlib, io, json, os, re, shlex, shutil, sqlite3, stat, subprocess, sys, zlib
 from dataclasses import dataclass, field
 
 from observatory.export import load_config
+from observatory.remote._sanitize import h as trace_hash  # the id hash the collector stores in letta_traces.trace
 
 csv.field_size_limit(1 << 31)
 
@@ -31,6 +34,8 @@ _ESCAPED_BYTE = re.compile("[\udc80-\udcff]")
 # Python's csv reader can't tell NULL from "" (or from any sentinel text), so NULL-ness travels separately: the
 # query adds one 0/1 digit per column in this extra column, computed by Postgres itself.
 NULL_MASK = "__observatory_null_mask"
+# --delete reads each row with Postgres's own md5 of its text form and deletes it only while it still has that md5.
+ROW_MD5 = "__observatory_row_md5"
 _IDENT = re.compile(r"^[a-z_][a-z0-9_]*$")
 
 
@@ -154,31 +159,44 @@ def trace_columns(config):
                           "where table_name = 'provider_traces' order by ordinal_position"],
                          env=env, capture_output=True, text=True, check=True).stdout
     columns = [line for line in out.splitlines() if line]
-    if not columns or any(not _IDENT.match(c) for c in columns) or NULL_MASK in columns:
+    if not columns or any(not _IDENT.match(c) for c in columns) or NULL_MASK in columns or ROW_MD5 in columns:
         raise RuntimeError(f"unexpected provider_traces columns: {columns!r}")
     return columns
 
 
-def stream_rows(config, where):
-    """provider_traces rows as dicts, NULL as None (from the mask, never from the text)."""
+def _stream(config, where, with_md5=False):
+    """(row, md5 or None) per provider_traces row: row as a dict, NULL as None (from the mask, never from the text);
+    md5 is Postgres's md5 of the row's text form, read in the same statement."""
     columns = trace_columns(config)
     mask = "concat(" + ", ".join(f'("{c}" is null)::int' for c in columns) + ")"
     select = ", ".join(f'"{c}"' for c in columns)
-    query = f'select {select}, {mask} as {NULL_MASK} from provider_traces {where} order by created_at, id'
+    extra = f", md5(provider_traces::text) as {ROW_MD5}" if with_md5 else ""
+    query = f'select {select}, {mask} as {NULL_MASK}{extra} from provider_traces {where} order by created_at, id'
     cmd, env = _psql(config)
     proc = subprocess.Popen([*cmd, "-c", f"\\copy ({query}) to stdout with (format csv, header, force_quote *)"],
                             stdout=subprocess.PIPE, env=env)
     text = io.TextIOWrapper(proc.stdout, encoding="utf-8", errors="surrogateescape", newline="")
-    yield from (decode_nulls(row, columns) for row in csv.DictReader(text))
+    for row in csv.DictReader(text):
+        digest = row.pop(ROW_MD5) if with_md5 else None
+        yield decode_nulls(row, columns), digest
     if proc.wait() != 0:
         raise RuntimeError(f"psql exited with {proc.returncode}")
 
 
+def stream_rows(config, where):
+    """provider_traces rows as dicts, NULL as None (from the mask, never from the text)."""
+    yield from (row for row, _ in _stream(config, where))
+
+
+def cutoff_time(older_than_days, now=None):
+    """The retention cutoff as ISO text: rows created before it are 'older than N days'."""
+    now = now or datetime.datetime.now(datetime.timezone.utc)
+    return (now - datetime.timedelta(days=older_than_days)).isoformat()
+
+
 def where_clause(older_than_days, date_from=None, date_to=None, now=None):
     """created_at bounds. Dates are validated, never interpolated raw; --to is inclusive."""
-    now = now or datetime.datetime.now(datetime.timezone.utc)
-    cutoff = (now - datetime.timedelta(days=older_than_days)).isoformat()
-    parts = [f"created_at < '{cutoff}'"]
+    parts = [f"created_at < '{cutoff_time(older_than_days, now)}'"]
     for value, op, shift in ((date_from, ">=", 0), (date_to, "<", 1)):
         if value:
             if not _DATE.match(value):
@@ -257,6 +275,8 @@ create table if not exists traces (id text primary key, day text not null, creat
 create index if not exists traces_day on traces (day, created_at, id);
 create table if not exists runs (run integer primary key, started_at text not null, finished_at text, args text not null,
     totals text);
+create table if not exists deletions (id text primary key, day text not null, deleted_at text not null,
+    run integer not null);
 """
 ARCHIVE_STATS = ("rows", "new", "already", "verified", "conflict", "undecodable", "verify_failed", "reread_failed",
                  "added_bytes")
@@ -529,13 +549,158 @@ def write_csv(rows, path):
     return n, columns
 
 
+# --- step 3: delete what the archive holds and telemetry has analysed ----------------------------------------------
+
+MIN_DELETE_DAYS = 30
+DEFAULT_BATCH_ROWS = 50
+DELETE_STATS = ("rows", "deleted", "would_delete", "not_archived", "not_analysed", "mismatch", "changed", "unsafe_id",
+                "deferred")
+# Ids and digests go into the DELETE statement as literals, so only these shapes are ever sent; any other id is skipped.
+_SAFE_ID = re.compile(r"^[A-Za-z0-9_.:-]{1,200}$")
+_MD5 = re.compile(r"^[0-9a-f]{32}$")
+
+
+def analysed_traces(config):
+    """The hashed trace ids in telemetry's letta_traces: the 'analysed' half of the delete rule. Read-only. A missing
+    telemetry database is an error, never 'nothing analysed'."""
+    path = os.path.join(config.get("TELEMETRY_DIR") or "", "telemetry.db")
+    if not config.get("TELEMETRY_DIR") or not os.path.isfile(path):
+        raise RuntimeError("--delete needs TELEMETRY_DIR with the collector's telemetry.db in the config")
+    tel = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+    try:
+        return {t for (t,) in tel.execute("select trace from letta_traces") if t}
+    finally:
+        tel.close()
+
+
+def _psql_write(config):
+    """psql for the one session that may write. Only the read-only default is dropped, so it prints rows (and their
+    md5) under the same server settings as the reads."""
+    cmd, env = _psql(config)
+    env["PGOPTIONS"] = "-c jit=off"
+    return cmd, env
+
+
+def _delete_batch(config, batch, cutoff):
+    """Delete, in one statement (its own transaction), each (id, md5) row that still has the md5 it had when it was
+    checked and is older than the cutoff. Returns the ids Postgres deleted: a row changed since its check stays."""
+    values = ", ".join(f"('{trace_id}', '{digest}')" for trace_id, digest, _ in batch)  # shapes checked by the caller
+    sql = (f"delete from provider_traces t using (values {values}) as v(id, md5) "
+           f"where t.id = v.id and md5(t::text) = v.md5 and t.created_at < '{cutoff}' returning t.id")
+    cmd, env = _psql_write(config)
+    out = subprocess.run([*cmd, "-v", "ON_ERROR_STOP=1", "-A", "-t", "-c", sql], env=env, capture_output=True,
+                         text=True, check=True).stdout
+    asked = {trace_id for trace_id, _, _ in batch}
+    return {line for line in out.splitlines() if line in asked}
+
+
+def _vacuum(config):
+    """Plain VACUUM: new rows reuse the space; the file doesn't shrink (that's VACUUM FULL, which locks the table)."""
+    cmd, env = _psql_write(config)
+    subprocess.run([*cmd, "-v", "ON_ERROR_STOP=1", "-c", "vacuum (analyze) provider_traces"], env=env,
+                   capture_output=True, text=True, check=True)
+
+
+def run_delete(config, directory, older_than_days=DEFAULT_OLDER_THAN_DAYS, date_from=None, date_to=None,
+               batch_rows=DEFAULT_BATCH_ROWS, max_rows=None, dry_run=False, vacuum=True, now=None, out=sys.stdout):
+    """Delete old rows that are in the archive and analysed, day by day, oldest first. Right before its delete, each
+    row is read again from Postgres and must be verified in the archive, have its hashed id in telemetry, and still be
+    rebuilt exactly from the archive's bytes. It's then deleted only while it has the md5 it was read with. Deleted ids
+    are recorded in the archive's `deletions` table; at the end, plain VACUUM if anything went. --dry-run does every
+    check and deletes nothing. Returns 4 when any row failed its re-check (mismatch) or changed before its delete,
+    else 0."""
+    if older_than_days < MIN_DELETE_DAYS:
+        raise ValueError(f"--delete keeps at least the last {MIN_DELETE_DAYS} days")
+    if batch_rows < 1 or (max_rows is not None and max_rows < 1):
+        raise ValueError("--batch-rows and --max-rows must be at least 1")
+    if not os.path.isfile(os.path.join(directory, ARCHIVE_DB)):
+        raise RuntimeError("no archive in that directory: --archive first")
+    now = now or datetime.datetime.now(datetime.timezone.utc)  # one cutoff for the whole run
+    where, cutoff = where_clause(older_than_days, date_from, date_to, now=now), cutoff_time(older_than_days, now)
+    analysed = analysed_traces(config)
+    db, path, lock = open_archive(directory)
+    reader = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+    try:
+        with db:
+            run = db.execute("insert into runs (started_at, args) values (?, ?)",
+                             (_now(), f"delete{' --dry-run' if dry_run else ''} {where}")).lastrowid
+        days, budget = {}, max_rows
+        for day, _ in day_counts(config, where):
+            # Check the whole day in its read-only transaction, then delete in batches after it has ended.
+            eligible = []
+            for row, digest in _stream(config, where_clause(older_than_days, day, day, now=now), with_md5=True):
+                stats = days.setdefault(trace_day(row.get("created_at")), dict.fromkeys(DELETE_STATS, 0))
+                stats["rows"] += 1
+                trace_id = row["id"]
+                if not _SAFE_ID.match(trace_id) or not _MD5.match(digest or ""):
+                    stats["unsafe_id"] += 1
+                    continue
+                got = db.execute("select verified_at from traces where id = ?", (trace_id,)).fetchone()
+                if not got or not got[0]:
+                    stats["not_archived"] += 1
+                elif trace_hash(trace_id) not in analysed:
+                    stats["not_analysed"] += 1
+                elif not verify_archived(reader, row):
+                    stats["mismatch"] += 1
+                elif budget is not None and budget <= 0:
+                    stats["deferred"] += 1
+                else:
+                    eligible.append((trace_id, digest, trace_day(row.get("created_at"))))
+                    budget = None if budget is None else budget - 1
+            for start in range(0, len(eligible), batch_rows):
+                batch = eligible[start:start + batch_rows]
+                if dry_run:
+                    for _, _, d in batch:
+                        days[d]["would_delete"] += 1
+                    continue
+                deleted, deleted_at = _delete_batch(config, batch, cutoff), _now()
+                with db:
+                    db.executemany("insert or replace into deletions values (?, ?, ?, ?)",
+                                   [(t, d, deleted_at, run) for t, _, d in batch if t in deleted])
+                for t, _, d in batch:
+                    days[d]["deleted" if t in deleted else "changed"] += 1
+        totals = {key: sum(d[key] for d in days.values()) for key in DELETE_STATS}
+        vacuumed = bool(vacuum and totals["deleted"])
+        if vacuumed:
+            _vacuum(config)
+        with db:
+            db.execute("update runs set finished_at = ?, totals = ? where run = ?",
+                       (_now(), json.dumps({**totals, "vacuumed": vacuumed}), run))
+        delete_report(days, totals, dry_run, vacuumed, out)
+        return 4 if totals["mismatch"] or totals["changed"] else 0
+    finally:
+        reader.close()
+        db.close()
+        lock.close()
+
+
+def delete_report(days, totals, dry_run, vacuumed, out=sys.stdout):
+    out.write("day          rows  deleted  would_delete  not_archived  not_analysed  mismatch  changed  unsafe_id  deferred\n")
+    for day in sorted(days):
+        d = days[day]
+        out.write(f"{day:<10} {d['rows']:6d} {d['deleted']:8d} {d['would_delete']:13d} {d['not_archived']:13d}"
+                  f" {d['not_analysed']:13d} {d['mismatch']:9d} {d['changed']:8d} {d['unsafe_id']:10d} {d['deferred']:9d}\n")
+    t = totals
+    out.write(f"{'total':<10} {t['rows']:6d} {t['deleted']:8d} {t['would_delete']:13d} {t['not_archived']:13d}"
+              f" {t['not_analysed']:13d} {t['mismatch']:9d} {t['changed']:8d} {t['unsafe_id']:10d} {t['deferred']:9d}\n")
+    if dry_run:
+        out.write("dry run: nothing deleted.\n")
+    elif vacuumed:
+        out.write("VACUUM done: new rows reuse the space; giving it back to the disk needs VACUUM FULL (not done here).\n")
+    if t["mismatch"] or t["changed"]:
+        out.write("mismatch / changed rows stay in Postgres: run --archive to see what differs.\n")
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     mode = parser.add_mutually_exclusive_group(required=True)
     mode.add_argument("--plan", action="store_true", help="dry run: read only, write nothing")
     mode.add_argument("--archive", action="store_true", help="write and verify the archive (needs --archive-dir)")
     mode.add_argument("--restore-day", metavar="YYYY-MM-DD", help="write that day's verified rows to --out as CSV")
-    parser.add_argument("--config", help="observatory config (Letta psql settings); needed by --plan and --archive")
+    mode.add_argument("--delete", action="store_true",
+                      help="delete old rows that are verified in the archive and analysed by telemetry (writes Postgres)")
+    parser.add_argument("--config", help="observatory config (Letta psql settings, TELEMETRY_DIR); needed by --plan, "
+                                         "--archive and --delete")
     parser.add_argument("--archive-dir", help="archive directory: owned by the running user, mode 700")
     parser.add_argument("--out", help="CSV file for --restore-day; must not exist yet")
     parser.add_argument("--older-than-days", type=int, default=DEFAULT_OLDER_THAN_DAYS)
@@ -543,13 +708,21 @@ def main():
     parser.add_argument("--to", dest="date_to", help="YYYY-MM-DD inclusive, server time zone")
     parser.add_argument("--min-free-gb", type=float, default=DEFAULT_MIN_FREE_GB,
                         help="--archive stops before a day when the archive's file system has less free space")
+    parser.add_argument("--dry-run", action="store_true", help="--delete: every check, no delete")
+    parser.add_argument("--batch-rows", type=int, default=DEFAULT_BATCH_ROWS, help="--delete: rows per DELETE statement")
+    parser.add_argument("--max-rows", type=int, help="--delete: delete at most this many rows in this run")
+    parser.add_argument("--no-vacuum", action="store_true", help="--delete: skip the plain VACUUM at the end")
     args = parser.parse_args()
     if args.older_than_days < 1:
         parser.error("--older-than-days must be at least 1")
-    if (args.plan or args.archive) and not args.config:
-        parser.error("--plan and --archive need --config")
-    if (args.archive or args.restore_day) and not args.archive_dir:
-        parser.error("--archive and --restore-day need --archive-dir")
+    if (args.plan or args.archive or args.delete) and not args.config:
+        parser.error("--plan, --archive and --delete need --config")
+    if (args.archive or args.restore_day or args.delete) and not args.archive_dir:
+        parser.error("--archive, --restore-day and --delete need --archive-dir")
+    if args.delete and args.older_than_days < MIN_DELETE_DAYS:
+        parser.error(f"--delete keeps at least the last {MIN_DELETE_DAYS} days (--older-than-days >= {MIN_DELETE_DAYS})")
+    if (args.dry_run or args.max_rows is not None or args.no_vacuum) and not args.delete:
+        parser.error("--dry-run, --max-rows and --no-vacuum only go with --delete")
     if args.restore_day:
         if not args.out or not _DATE.match(args.restore_day):
             parser.error("--restore-day needs a YYYY-MM-DD day and --out")
@@ -566,6 +739,9 @@ def main():
     if args.archive:
         sys.exit(run_archive(config, args.archive_dir, args.older_than_days, args.date_from, args.date_to,
                              args.min_free_gb))
+    if args.delete:
+        sys.exit(run_delete(config, args.archive_dir, args.older_than_days, args.date_from, args.date_to,
+                            args.batch_rows, args.max_rows, args.dry_run, not args.no_vacuum))
     days, totals = plan(stream_rows(config, where_clause(args.older_than_days, args.date_from, args.date_to)))
     report(days, totals)
 
