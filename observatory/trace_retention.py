@@ -69,22 +69,38 @@ def timestamp(value):
     return ts if ts.tzinfo else ts.replace(tzinfo=datetime.timezone.utc)
 
 
-def last_ok(status):
+# How far ahead of the reader's clock a timestamp may be and still count. A later one (a skewed clock when it was
+# written, or a damaged file) would win every "newest" comparison and hide failures, so it's ignored instead.
+CLOCK_SKEW = datetime.timedelta(minutes=10)
+
+
+def _clock():
+    return datetime.datetime.now(datetime.timezone.utc)
+
+
+def _usable(value, now):
+    """timestamp(value) if it isn't later than now + CLOCK_SKEW, else None."""
+    t = timestamp(value)
+    return t if t and t <= now + CLOCK_SKEW else None
+
+
+def last_ok(status, now):
     """When the newest real run that exited 0 finished, as its ISO text, from a status dict; None if none is known.
     Candidates: the run itself when it's a good real run, and its carried `last_ok_at` (status files from before that
-    field have none). Only real timestamps count: anything else would be copied forward forever."""
+    field have none). Only real timestamps no later than `now` (the reader's clock) + CLOCK_SKEW count: anything else
+    would be copied forward forever."""
     if not isinstance(status, dict):
         return None
     good = status.get("exit") == 0 and status.get("dry_run") is False
     valid = [(t, v) for v in (status.get("last_ok_at"), status.get("finished_at") if good else None)
-             if (t := timestamp(v))]
+             if (t := _usable(v, now))]
     return max(valid)[1] if valid else None
 
 
-def first_seen(status, written):
+def first_seen(status, written, now):
     """Where the retention clock starts for a status: its `since`, else its `started_at` (files from before `since`),
-    else when the file was written. Only real timestamps count."""
-    return timestamp(status.get("since")) or timestamp(status.get("started_at")) or written
+    else when the file was written. Only real timestamps no later than `now` + CLOCK_SKEW count."""
+    return _usable(status.get("since"), now) or _usable(status.get("started_at"), now) or written
 
 
 def read_status(path):
@@ -106,14 +122,17 @@ def read_status(path):
 def _publish_status(status_path, status):
     """Merge the clocks with the last status file and write this one, both under the status lock, so a run that read
     an older status can never overwrite a newer one: `last_ok_at` is the newest good real run either knows of, `since`
-    the earliest start. Only a missing file makes this run the first."""
+    the earliest start, each checked against the clock at the merge (CLOCK_SKEW). Only a missing file makes this run
+    the first."""
     with open(status_path + ".lock", "a") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)  # held for one read and one write
+        now = _clock()  # under the lock: a concurrent run's success, published before this, is never "future"
         previous, written = read_status(status_path)
         start = timestamp(status["started_at"])
-        before = first_seen(previous, written) if written else None
+        before = first_seen(previous, written, now) if written else None
         status["since"] = min(before, start).isoformat() if before else status["started_at"]
-        newest = [(t, v) for v in (last_ok(previous), last_ok({**status, "last_ok_at": None})) if (t := timestamp(v))]
+        newest = [(t, v) for v in (last_ok(previous, now), last_ok({**status, "last_ok_at": None}, now))
+                  if (t := timestamp(v))]
         status["last_ok_at"] = max(newest)[1] if newest else None
         _write_json(status_path, status)
         os.chmod(status_path, 0o640)  # as the collector's files in TELEMETRY_DIR

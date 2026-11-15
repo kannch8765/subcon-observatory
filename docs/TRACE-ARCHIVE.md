@@ -171,7 +171,9 @@ it reads them back only in its debug API (a step's trace), which answers "not fo
    snapshot's error class, and an unexpected error's class, as JSON (mode 640), on every path. A delete that stops
    after its runs row keeps its counts there with `exit` null. Two fields carry over from the last status file:
    `last_ok_at` (when the newest real run that exited 0 finished; a dry run never counts) and `since` (the first run
-   of any kind, dry runs included). Only real timestamps are carried; a file that can't be read as a JSON object
+   of any kind, dry runs included). Only real timestamps no later than the reader's clock + 10 minutes
+   (`CLOCK_SKEW`) count, for the writer at the merge and for the healthcheck at its check: a future-dated success
+   (a skewed clock when it was written, or a damaged file) would otherwise hide every later failure. A file that can't be read as a JSON object
    (damaged, another JSON type, nesting too deep) counts from when it was written, and only a missing file makes a
    run the first. The read, the merge (the newest good run and the earliest start either side knows) and the write
    happen under one lock (`trace_retention.json.lock`), so a run that read an older status never overwrites a newer

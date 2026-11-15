@@ -107,13 +107,15 @@ def values(db, now, disk_paths):
 def trace_retention_age_h(telemetry_dir, now):
     """Hours since the last real retention run that exited 0, or since its first run while none has; None when
     retention doesn't run here (no status file). A status file that can't be read as a JSON object counts from when it
-    was written (trace_retention.read_status), so a damaged file warns in time and never stops the healthcheck."""
+    was written (trace_retention.read_status), so a damaged file warns in time and never stops the healthcheck; a
+    timestamp later than `now` + trace_retention.CLOCK_SKEW is ignored, so a future-dated success can't hide failures."""
     if not telemetry_dir:
         return None
     status, written = trace_retention.read_status(os.path.join(telemetry_dir, TRACE_RETENTION_STATUS))
     if written is None:
         return None
-    since = trace_retention.timestamp(trace_retention.last_ok(status)) or trace_retention.first_seen(status, written)
+    since = (trace_retention.timestamp(trace_retention.last_ok(status, now))
+             or trace_retention.first_seen(status, written, now))
     return max(0.0, (now - since).total_seconds() / 3600)
 
 

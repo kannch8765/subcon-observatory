@@ -514,7 +514,7 @@ def test_the_status_carries_the_last_good_real_run_and_the_first_run(tmp_path, f
     assert night(config, directory, offsite, status, now=NOW + datetime.timedelta(days=1))[0] == 5
     failed = json.loads(open(status).read())
     assert (failed["last_ok_at"], failed["since"]) == (good["finished_at"], first["since"])
-    assert tr.last_ok(failed) == good["finished_at"]
+    assert tr.last_ok(failed, datetime.datetime.now(datetime.timezone.utc)) == good["finished_at"]
 
 
 def test_a_status_from_before_these_fields_still_counts_as_the_last_good_run(tmp_path, fake_age, monkeypatch):
@@ -595,13 +595,62 @@ def test_a_status_that_isnt_a_readable_object_keeps_its_age_over_failed_nights(t
         assert retention_age(status) >= 72
 
 
-def test_the_merge_keeps_the_newest_good_run_either_side_knows(tmp_path, fake_age):
-    config, directory, offsite, status = daily(tmp_path)
-    newer = (real_now() + datetime.timedelta(hours=2)).isoformat()  # e.g. another run's success, written first
-    seed(status, json.dumps({"since": "2026-11-01T00:00:00+00:00", "last_ok_at": newer}), 0)
-    assert night(config, directory, offsite, status)[0] == 0
-    s = json.loads(open(status).read())
-    assert s["last_ok_at"] == newer and tr.last_ok(s) == newer
+def publish(status, clock, monkeypatch, **fields):
+    """trace_retention's status publication with the merge's clock set to `clock`."""
+    monkeypatch.setattr(tr, "_clock", lambda: clock)
+    record = {"started_at": (clock - datetime.timedelta(minutes=4)).isoformat(), "finished_at": clock.isoformat(),
+              "exit": 0, "dry_run": False, **fields}
+    tr._publish_status(status, record)
+    return json.loads(open(status).read())
+
+
+def age_at(status, clock):
+    from observatory import health
+    return health.trace_retention_age_h(os.path.dirname(status), clock)
+
+
+T = datetime.datetime(2026, 11, 20, 4, 44, tzinfo=datetime.timezone.utc)
+
+
+def test_the_merge_keeps_a_concurrent_runs_newer_success(tmp_path, monkeypatch):
+    status = str(tmp_path / "trace_retention.json")
+    publish(status, T - datetime.timedelta(minutes=1), monkeypatch)  # B: finished after A, published first
+    s = publish(status, T, monkeypatch, finished_at=(T - datetime.timedelta(minutes=5)).isoformat())  # A, good
+    assert s["last_ok_at"] == (T - datetime.timedelta(minutes=1)).isoformat()
+    s = publish(status, T + datetime.timedelta(minutes=1), monkeypatch, exit=5)  # a late failure keeps it too
+    assert s["last_ok_at"] == (T - datetime.timedelta(minutes=1)).isoformat()
+
+
+def test_a_future_dated_success_never_hides_failures_once_the_clock_is_right(tmp_path, monkeypatch):
+    status = str(tmp_path / "trace_retention.json")
+    publish(status, T + datetime.timedelta(days=30), monkeypatch)  # recorded while the clock read 30 days ahead
+    s = publish(status, T, monkeypatch)  # the clock is right again: a correctly dated success
+    assert s["last_ok_at"] == T.isoformat()
+    for night in range(1, 5):  # then four failed nights
+        s = publish(status, T + datetime.timedelta(days=night), monkeypatch, exit=5)
+        assert s["last_ok_at"] == T.isoformat()
+    assert age_at(status, T + datetime.timedelta(hours=47.9)) == pytest.approx(47.9)
+    from observatory import health
+    warn, _ = health.thresholds({})["trace_retention_last_ok_age_h"]
+    assert health.level(age_at(status, T + datetime.timedelta(hours=48)), warn, None) == "warn"  # the boundary
+    assert age_at(status, T + datetime.timedelta(hours=96)) == pytest.approx(96)
+
+
+def test_a_future_dated_carried_success_falls_back_to_the_start(tmp_path, monkeypatch):
+    status = str(tmp_path / "trace_retention.json")
+    open(status, "w").write(json.dumps({"since": (T - datetime.timedelta(hours=72)).isoformat(),
+                                        "last_ok_at": (T + datetime.timedelta(days=30)).isoformat()}))
+    assert age_at(status, T) == pytest.approx(72)  # the reader ignores it
+    s = publish(status, T, monkeypatch, exit=5)  # and the writer doesn't carry it on
+    assert s["last_ok_at"] is None and age_at(status, T) == pytest.approx(72)
+
+
+def test_the_clock_skew_allowance_is_ten_minutes(tmp_path):
+    status = str(tmp_path / "trace_retention.json")
+    for ahead, counted in ((9, True), (11, False)):
+        open(status, "w").write(json.dumps({"since": (T - datetime.timedelta(hours=72)).isoformat(),
+                                            "last_ok_at": (T + datetime.timedelta(minutes=ahead)).isoformat()}))
+        assert (age_at(status, T) == 0) is counted
 
 
 def test_a_success_published_while_another_run_writes_its_status_is_never_lost(tmp_path, fake_age, monkeypatch):
@@ -635,3 +684,12 @@ def test_a_success_published_while_another_run_writes_its_status_is_never_lost(t
     s = json.loads(open(status).read())
     assert s["exit"] == 0 and tr.timestamp(s["last_ok_at"]) > real_now() - datetime.timedelta(minutes=5)
     assert retention_age(status) < 1
+
+
+def test_a_future_dated_since_falls_back_to_a_real_start(tmp_path, monkeypatch):
+    status = str(tmp_path / "trace_retention.json")
+    open(status, "w").write(json.dumps({"since": (T + datetime.timedelta(days=30)).isoformat(),
+                                        "started_at": (T - datetime.timedelta(hours=72)).isoformat(), "exit": 5}))
+    assert age_at(status, T) == pytest.approx(72)
+    s = publish(status, T, monkeypatch, exit=5)
+    assert tr.timestamp(s["since"]) == T - datetime.timedelta(hours=72)
