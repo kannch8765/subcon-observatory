@@ -3,9 +3,9 @@
 Prints the fixture rows of the first table named in the query as CSV with a header. Also takes --delete's two writes:
 `delete from provider_traces t using (values ...) ... returning t.id` (rewrites the fixtures file, prints the deleted
 ids), `vacuum ...` (no-op; with "__vacuum_warning" in the fixtures it warns on stderr like PG does when it skips a
-table: `true` for PG's English text, a string for that text; held back when "__role_client_min_messages" is "error"
-and PGOPTIONS doesn't set its own) and `select id from provider_traces where id in (...)` (`-A -t`: the ids that exist). Every query is appended
-to <fixtures.json>.log, one per line."""
+table: `true` writes PG's English text, a string is written as given; held back when "__role_client_min_messages" is
+"error" and PGOPTIONS doesn't set its own) and `select id from provider_traces where id in (...)` (`-A -t`: the ids
+that exist). Every query is appended to <fixtures.json>.log, one per line."""
 import hashlib, json, os, re, sys
 
 fixtures_path = sys.argv[1]
