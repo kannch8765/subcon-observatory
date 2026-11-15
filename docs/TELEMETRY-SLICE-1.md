@@ -104,11 +104,13 @@ IOSchedulingClass=idle
 ProtectSystem=strict
 ReadWritePaths=<TELEMETRY_DIR>
 ProtectHome=read-only
-PrivateTmp=no                      # must see the runtime's PrivateTmp logs until they move
+# must see the runtime's PrivateTmp logs until they move
+PrivateTmp=no
 NoNewPrivileges=yes
 CapabilityBoundingSet=CAP_DAC_READ_SEARCH
 IPAddressDeny=any
-IPAddressAllow=localhost           # Letta Postgres only
+# Letta Postgres only
+IPAddressAllow=localhost
 MemoryMax=512M
 RuntimeMaxSec=20min
 ```

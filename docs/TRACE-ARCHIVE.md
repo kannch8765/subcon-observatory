@@ -44,11 +44,10 @@ count them.
 | 1 | `--plan`: per day, rows, raw size, new distinct messages, estimated archive size (each blob zlib-compressed on its own; no framing, checksums or file system overhead, so not a storage guarantee), rows that rebuild | nothing |
 | 2 | `--archive`: write the archive (outside the Letta database, readable by root only), re-read and verify each row; `--restore-day` writes verified rows back out as CSV | archive only |
 | 3 | `--delete`: delete verified rows that telemetry has analysed, in small batches, re-checking each against Postgres first, then `VACUUM` | Postgres |
-| 4 | daily timer: steps 2 and 3 for the day that just left the window | both |
+| 4 | `observatory.trace_retention`, daily timer: steps 2 and 3 for the whole day that just left the window, then an encrypted snapshot of the archive for its off-site copy | both |
 
-Steps 1 to 3 are in this version. Step 4 is its own change and needs the owner's go, and so does every real
-`--delete` run. After step 3, plain `VACUUM` lets new traces reuse the space, so the table stops growing; giving the
-space back to the disk needs `VACUUM FULL`, which locks the table for the rewrite and is a separate decision.
+After step 3, plain `VACUUM` lets new traces reuse the space, so the table stops growing; giving the space back to the
+disk needs `VACUUM FULL`, which locks the table for the rewrite and is a separate decision.
 
 ## Archive file (step 2)
 
@@ -140,11 +139,119 @@ else before the first real delete (where is the owner's decision: it holds conve
 Deleted rows stay restorable: `--restore-day` reads only the archive. Letta only writes `provider_traces` while it runs;
 it reads them back only in its debug API (a step's trace), which answers "not found" for deleted rows.
 
+## Daily retention (step 4)
+
+`observatory.trace_retention` is what the timer runs each night:
+
+1. **One cutoff, whole days.** The last day is the day `older-than-days + 1` days ago in `TELEMETRY_TZ` (the server's
+   zone when unset), and both steps get it as `--to` and the same cutoff. So they see the same rows, no day is split
+   between two nights, and rows stay 30 to 31 days. Rows newer than the cutoff stay whatever zone Postgres uses for
+   days: the cutoff is in every query too.
+2. **`--archive`** through that day. Normally that's one day (older ones are gone); after a break it catches up.
+3. **`--delete`** through that day, only if `--archive` exited 0. It still re-checks every row itself (see step 3).
+4. **Snapshot**, always, whatever happened before (rows may already be gone): a consistent copy of the archive
+   (SQLite's backup API, under the archive's lock, so no run writes meanwhile), encrypted with
+   [age](https://age-encryption.org) to the owner's public key into `--offsite-dir`, one file per run
+   (`provider_traces.<UTC time>-<sha256 prefix>.sqlite3.age`). The server never holds the private key.
+   - **The manifest is the pointer.** `provider_traces.sqlite3.age.json` names the current file, with its size and
+     sha256, the plaintext's size and sha256, and the verified rows, days and messages it holds. It's written last,
+     in one rename. Until then the last file and manifest are untouched, so any failure (an exception or a kill) leaves
+     the last pair as it was; whatever the failed run wrote is removed (by the next run after a kill).
+   - The file before the current one stays until the next run, for a pull that started before the switch; older ones
+     are removed at the start of a run, to make room.
+   - **A new snapshot is published only if** the copy passes SQLite's `quick_check`; every verified trace's record, and
+     then every message those records need (each distinct message once), still decompresses and matches its hash, as
+     `--restore-day` reads them (the archive pass re-reads only rows still in Postgres, so rows already deleted are
+     checked nowhere else); it holds at least as many verified rows as the last one (the archive only ever adds rows);
+     and age's output starts with age's header. A missing archive is never snapshotted.
+   - The plaintext copy exists only while it's checked and encrypted; a hard kill (timeout, OOM) can leave it in the
+     root-only directory until the next run removes it.
+   - The directory must belong to the running user and be mode 700, like the archive's.
+5. **Status**: `--status` writes the run's exits, both steps' counts (their `runs` rows), the manifest or the
+   snapshot's error class, and an unexpected error's class, as JSON (mode 640, for the health check), on every path.
+   A delete that stops after its runs row keeps its counts there with `exit` null.
+
+It prints counts, sizes and hashes only. An unexpected error prints its class name; the traceback goes to
+`retention-error.log` in the archive directory (root-only; don't print it without looking: a traceback may quote
+anything). `--dry-run` archives for real and runs `--delete --dry-run`.
+
+Exit codes: 0 all good; 3 `--archive` stopped for disk space (nothing deleted); 4 `--archive` or `--delete` reported
+rows that need a look, or the VACUUM failed or warned (their own output says which); 5 the snapshot failed (the deletes
+stand, the last snapshot is older); 1 an unexpected error. Any of them fails the unit. A `conflict` or `reread_failed`
+row (exit 4) holds every night's delete until someone looks, on purpose: the health check is to warn about it.
+
+**Off-site copy.** The owner pulls the manifest and the file it names to their own machine about weekly, checks the
+file's size and sha256 against the manifest, and keeps the previous copy until the new one checks out; a decrypt check
+now and then compares the plaintext sha256. Between pulls, the newest rows' only copy is the archive on the server (their metrics are in telemetry).
+
+**Unit and timer** (`/etc/systemd/system/`), the collector's sandbox plus what the step 3 runs showed. systemd takes
+only whole-line comments: a `# ...` after a value becomes part of it, and the setting is ignored with a warning
+(`systemd-analyze verify` still exits 0), so check its output, not only its exit code:
+
+```ini
+# subcon-trace-retention.service
+[Unit]
+Description=Subcon trace retention: archive, then delete, provider_traces older than 30 days; encrypted snapshot
+After=letta-selfhost-postgres.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=<pinned observatory checkout>
+ExecStart=/usr/bin/python3 -E -s -m observatory.trace_retention --config <config> --archive-dir <archive dir> \
+    --offsite-dir <offsite dir> --age-recipient <owner's age1... key> --status <TELEMETRY_DIR>/trace_retention.json
+UMask=0077
+Nice=19
+IOSchedulingClass=idle
+ProtectSystem=strict
+ProtectHome=read-only
+# SQLite's spill files; psql reaches Postgres over TCP
+PrivateTmp=yes
+# telemetry.db is in WAL mode: even a read-only open creates its -shm/-wal next to it, so the directory is writable
+# and the database file itself is not
+ReadWritePaths=<archive dir> <offsite dir> <TELEMETRY_DIR>
+ReadOnlyPaths=<TELEMETRY_DIR>/telemetry.db
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+NoNewPrivileges=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+CapabilityBoundingSet=CAP_DAC_READ_SEARCH
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+IPAddressDeny=any
+# Letta Postgres only
+IPAddressAllow=localhost
+# a first full --archive peaked at 993 MB; a normal night needs far less
+MemoryMax=1500M
+# a normal night takes minutes; this bounds a catch-up after a break
+TimeoutStartSec=2h
+
+# subcon-trace-retention.timer
+[Unit]
+Description=Nightly Subcon trace retention
+
+[Timer]
+OnCalendar=*-*-* 04:40:00 Asia/Tokyo
+AccuracySec=1min
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+```
+
+- 04:40 is inside the alert quiet hours and away from the collector's :17.
+- The archive and off-site directories must exist (mode 700) before the unit starts: systemd refuses a missing
+  `ReadWritePaths`. All three directories belong to root: the bounding set has no `CAP_DAC_OVERRIDE`, so root writes
+  only where it's the owner.
+- The checkout is pinned to a reviewed commit, as the collector's.
+
 ## Privacy
 
-The archive still holds conversation content, so it lives outside the Letta database with root-only permissions, and no
-part of it leaves the server. `--plan`, `--archive` and `--delete` print counts and sizes only; `--restore-day`
-writes content to a root-only file on the server and prints only a row count.
+The archive still holds conversation content, so it lives outside the Letta database with root-only permissions. The
+only part that leaves the server is the snapshot, encrypted to the owner's key on the server and pulled by the owner.
+`--plan`, `--archive`, `--delete` and `trace_retention` print counts, sizes and hashes only; `--restore-day` writes
+content to a root-only file on the server and prints only a row count.
 
 ## Running
 
@@ -155,6 +262,8 @@ python3 -E -s -m observatory.trace_archive --config <file> --archive --archive-d
 python3 -E -s -m observatory.trace_archive --restore-day 2026-08-08 --archive-dir /var/lib/subcon-trace-archive --out <file>
 python3 -E -s -m observatory.trace_archive --config <file> --delete --archive-dir /var/lib/subcon-trace-archive --dry-run
 python3 -E -s -m observatory.trace_archive --config <file> --delete --archive-dir /var/lib/subcon-trace-archive --max-rows 100
+python3 -E -s -m observatory.trace_retention --config <file> --archive-dir /var/lib/subcon-trace-archive \
+    --offsite-dir /var/lib/subcon-trace-offsite --age-recipient age1... --status <TELEMETRY_DIR>/trace_retention.json --dry-run
 ```
 
 It uses the same `LETTA_PSQL` / `LETTA_PG_ARGS` / `LETTA_PG_LIBDIR` settings as the exporters, in a read-only
