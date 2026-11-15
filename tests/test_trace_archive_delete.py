@@ -259,6 +259,27 @@ def test_a_vacuum_the_server_skips_with_a_warning_is_not_done(tmp_path):
     assert postgres_ids(tmp_path) == ["bad", "new"]
 
 
+@pytest.mark.parametrize("fixtures", [
+    {"__vacuum_warning": '警告:  "provider_traces"をVACUUMする権限がありません、スキップします'},  # lc_messages=ja
+    {"__vacuum_warning": True, "__role_client_min_messages": "error"},  # the role hides warnings by default
+    {"__vacuum_warning": True, "__dsn_client_min_messages": "error"},  # so does a connection string's own options
+], ids=["localized", "role_hides_warnings", "connection_options_hide_warnings"])
+def test_a_vacuum_warning_counts_in_any_language_and_whatever_the_role_default(tmp_path, fixtures):
+    config, directory, rows = archived(tmp_path)
+    (tmp_path / "letta.json").write_text(json.dumps({"provider_traces": rows, **fixtures}))
+    code, out = delete(config, directory)
+    assert code == 4 and totals(directory)["vacuum"] == "warning" and "server warning" in out
+    assert "権限" not in out and "permission denied" not in out  # the server's own text is not passed on
+    assert postgres_ids(tmp_path) == ["bad", "new"]
+
+
+def test_a_quiet_vacuum_is_done_even_when_the_role_hides_notices(tmp_path):
+    config, directory, rows = archived(tmp_path)
+    (tmp_path / "letta.json").write_text(json.dumps({"provider_traces": rows, "__role_client_min_messages": "error"}))
+    code, out = delete(config, directory)
+    assert code == 0 and totals(directory)["vacuum"] == "done" and "VACUUM done" in out
+
+
 def test_a_crash_right_after_the_delete_leaves_the_rows_marked_requested(tmp_path, monkeypatch):
     config, directory, _ = archived(tmp_path)
     real = ta._delete_batch

@@ -129,9 +129,10 @@ hide what was deleted. `--dry-run` makes every check and deletes nothing (it sti
 (or would_delete), not_archived, not_analysed, mismatch (the archive no longer rebuilds the row), changed, unsafe_id and
 deferred. Exit codes: 0 all good; 4 at least one `mismatch`, `changed` or `unsafe_id` row (they stay; `--archive`
 shows what differs), or the VACUUM failed or ended with a server warning (the deletes stand; without the right
-privilege PG skips the table with a WARNING and still succeeds; the server's text isn't passed on). A row that fails
-its re-check keeps its `verified_at`
-here: the next `--archive` run marks it.
+privilege PG skips the table with a WARNING and still succeeds; the server's text isn't passed on). The VACUUM session
+runs `set client_min_messages = warning` first, so neither a role default nor a connection string's own `options` set
+to `error` can hide the warning, and any stderr at all counts (whatever language the server writes it in, and psql's
+own messages too). A row that fails its re-check keeps its `verified_at` here: the next `--archive` run marks it.
 
 **After a delete the archive holds the only copy of those rows.** Keep a second copy of the archive file somewhere
 else before the first real delete (where is the owner's decision: it holds conversation content), and after each one.

@@ -3,16 +3,25 @@
 Prints the fixture rows of the first table named in the query as CSV with a header. Also takes --delete's two writes:
 `delete from provider_traces t using (values ...) ... returning t.id` (rewrites the fixtures file, prints the deleted
 ids), `vacuum ...` (no-op; with "__vacuum_warning" in the fixtures it warns on stderr like PG does when it skips a
-table) and `select id from provider_traces where id in (...)` (`-A -t`: the ids that exist). Every query is appended
-to <fixtures.json>.log, one per line."""
-import hashlib, json, re, sys
+table: `true` writes PG's English text, a string is written as given; held back when the session's
+client_min_messages is "error", see below) and `select id from provider_traces where id in (...)` (`-A -t`: the ids
+that exist). Several -c run in turn as psql does; only `set <name> = <value>` may come before the last one. Every
+command is appended to <fixtures.json>.log, one per line."""
+import hashlib, json, os, re, sys
 
 fixtures_path = sys.argv[1]
 fixtures = json.load(open(fixtures_path))
 sys.stdout.reconfigure(encoding="utf-8", errors="surrogateescape")  # a "\udcff" fixture goes out as the byte 0xff
-query = sys.argv[sys.argv.index("-c") + 1]
+commands = [sys.argv[i + 1] for i, arg in enumerate(sys.argv[:-1]) if arg == "-c"]  # each -c in turn, one session
+session = {}
+for command in commands[:-1]:
+    setting = re.fullmatch(r"set (\w+) = (\w+)", command)
+    if not setting:
+        sys.exit(f"fake_psql: only a `set` may come before the last -c, got {command[:80]!r}")
+    session[setting.group(1)] = setting.group(2)
+query = commands[-1]
 with open(fixtures_path + ".log", "a") as log:
-    log.write(query.replace("\n", " ") + "\n")
+    log.write("".join(command.replace("\n", " ") + "\n" for command in commands))
 
 
 def row_md5(row):
@@ -25,8 +34,17 @@ if "from information_schema.columns" in query:  # `-A -t` column-name listing, o
     print("\n".join(fixtures[table][0]))
     sys.exit(0)
 if query.startswith("vacuum"):
-    if fixtures.get("__vacuum_warning"):
-        sys.stderr.write('WARNING:  permission denied to vacuum "provider_traces", skipping it\n')
+    warning = fixtures.get("__vacuum_warning")
+    if warning is True:
+        warning = 'WARNING:  permission denied to vacuum "provider_traces", skipping it'
+    # client_min_messages, strongest first: a SET in this session; the connection's startup options, where a
+    # connection string's own `options` (fixture "__dsn_client_min_messages") replaces PGOPTIONS; the role default
+    # (fixture "__role_client_min_messages")
+    pgoptions = re.findall(r"-c client_min_messages=(\w+)", os.environ.get("PGOPTIONS", ""))
+    level = (session.get("client_min_messages") or fixtures.get("__dsn_client_min_messages")
+             or (pgoptions[-1] if pgoptions else None) or fixtures.get("__role_client_min_messages", "notice"))
+    if warning and level != "error":  # for client messages only error ranks above warning (log is below notice)
+        sys.stderr.write(warning + "\n")
     sys.exit(0)
 if query.startswith("select id from provider_traces where id in ("):
     wanted = set(re.findall(r"'([^']*)'", query))
