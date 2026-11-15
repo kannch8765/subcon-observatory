@@ -19,7 +19,9 @@ every message they need still match their hashes (rows already deleted from Post
 holds at least as many verified rows as the last one.
 
 Prints counts, sizes and hashes only. An unexpected error prints its class name; its traceback goes to a root-only file
-in the archive directory. --status writes the run's exits and counts as JSON (for the health check).
+in the archive directory. --status writes the run's exits and counts as JSON, plus `last_ok_at` (when the last real
+run that exited 0 finished) and `since` (the first run), both carried over from the last status: the health check
+warns when no real run has succeeded for 48 h.
 
 Exit codes: 0 all good; 3 --archive stopped for disk space (nothing deleted); 4 --archive or --delete reported rows that
 need a look, or the VACUUM failed or warned (see their output); 5 the snapshot failed (the deletes stand, the last
@@ -54,6 +56,32 @@ def _last_run(directory):
     finally:
         db.close()
     return args, json.loads(totals) if totals else None
+
+
+def last_ok(status):
+    """When the last real run that exited 0 finished, from a status dict; None if none is known. A real run that exited
+    0 is that run itself; otherwise its carried `last_ok_at` (status files from before that field have none)."""
+    if not isinstance(status, dict):
+        return None
+    if status.get("exit") == 0 and status.get("dry_run") is False:
+        return status.get("finished_at")
+    return status.get("last_ok_at")
+
+
+def _carried(status_path, status):
+    """`since` and `last_ok_at` from the last status file into this one. An unreadable file counts from when it was
+    written; a missing one makes this run the first."""
+    try:
+        previous = json.load(open(status_path))
+    except FileNotFoundError:
+        previous = {}
+    except (OSError, ValueError):
+        written = datetime.datetime.fromtimestamp(os.path.getmtime(status_path), datetime.timezone.utc)
+        previous = {"since": written.isoformat(timespec="seconds")}
+    previous = previous if isinstance(previous, dict) else {}
+    status["since"] = previous.get("since") or previous.get("started_at") or status["started_at"]
+    status["last_ok_at"] = last_ok(previous)
+    status["last_ok_at"] = last_ok(status)  # this run, if it is a good one
 
 
 def _sha256(path):
@@ -200,6 +228,7 @@ def run(config, directory, older_than_days=ta.DEFAULT_OLDER_THAN_DAYS, offsite_d
     status.update(finished_at=ta._now(), exit=code)
     if status_path:
         try:
+            _carried(status_path, status)
             _write_json(status_path, status)
             os.chmod(status_path, 0o640)  # as the collector's files in TELEMETRY_DIR
         except Exception as exc:

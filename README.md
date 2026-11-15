@@ -76,5 +76,4 @@ Each snapshot has a `snapshot.json` (row and redaction counts per table, plus th
 ## Roadmap
 
 - Weekly report delivery through the Subcon review bot
-- Trace retention status in the health check (warn when no good nightly run for 48 h)
 - Swap the SSH export for a dedicated telemetry store once it exists

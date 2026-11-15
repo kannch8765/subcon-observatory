@@ -500,3 +500,40 @@ def test_the_documented_retention_unit_verifies_without_any_diagnostic(tmp_path)
     result = subprocess.run(["systemd-analyze", "verify", str(tmp_path / "subcon-trace-retention.service"),
                              str(tmp_path / "subcon-trace-retention.timer")], capture_output=True, text=True)
     assert (result.returncode, result.stdout + result.stderr) == (0, "")  # the exit code alone hides ignored settings
+
+
+def test_the_status_carries_the_last_good_real_run_and_the_first_run(tmp_path, fake_age, monkeypatch):
+    config, directory, offsite, status = daily(tmp_path)
+    night(config, directory, offsite, status, dry_run=True)  # a dry run is never a good retention run
+    first = json.loads(open(status).read())
+    assert first["last_ok_at"] is None and first["since"] == first["started_at"]
+    night(config, directory, offsite, status)
+    good = json.loads(open(status).read())
+    assert good["last_ok_at"] == good["finished_at"] and good["since"] == first["since"]
+    monkeypatch.setenv("FAKE_AGE_FAIL", "1")  # the next night fails (snapshot, exit 5)
+    assert night(config, directory, offsite, status, now=NOW + datetime.timedelta(days=1))[0] == 5
+    failed = json.loads(open(status).read())
+    assert (failed["last_ok_at"], failed["since"]) == (good["finished_at"], first["since"])
+    assert tr.last_ok(failed) == good["finished_at"]
+
+
+def test_a_status_from_before_these_fields_still_counts_as_the_last_good_run(tmp_path, fake_age, monkeypatch):
+    config, directory, offsite, status = daily(tmp_path)
+    old = {"started_at": "2026-11-07T11:32:48+00:00", "finished_at": "2026-11-07T11:36:18+00:00", "exit": 0,
+           "dry_run": False}  # as written by the first release of trace_retention
+    open(status, "w").write(json.dumps(old))
+    monkeypatch.setenv("FAKE_AGE_FAIL", "1")
+    assert night(config, directory, offsite, status)[0] == 5
+    s = json.loads(open(status).read())
+    assert (s["last_ok_at"], s["since"]) == (old["finished_at"], old["started_at"])
+
+
+def test_an_unreadable_status_counts_from_when_it_was_written(tmp_path, fake_age, monkeypatch):
+    config, directory, offsite, status = daily(tmp_path)
+    open(status, "w").write("{not json")
+    os.utime(status, (1_700_000_000, 1_700_000_000))
+    monkeypatch.setenv("FAKE_AGE_FAIL", "1")
+    night(config, directory, offsite, status)
+    s = json.loads(open(status).read())
+    assert s["last_ok_at"] is None
+    assert s["since"] == datetime.datetime.fromtimestamp(1_700_000_000, datetime.timezone.utc).isoformat(timespec="seconds")

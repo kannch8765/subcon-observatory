@@ -1,9 +1,10 @@
 """Healthcheck over the telemetry store: each check -> ok / warn / alert with its value and thresholds.
 Output is numbers and fixed names only, so a bot can render it without seeing any content."""
-import datetime, shutil
+import datetime, json, os, shutil
 
 from observatory.rollup import RESOLVED_INTENT, backlog_gap, pct, rows
 from observatory.telemetry import parse_ts
+from observatory import trace_retention
 
 LEVELS = ["ok", "warn", "alert"]
 # name -> (warn, alert); `None` = that level is not used. Override with HEALTH_<NAME>_WARN / _ALERT in config.
@@ -18,7 +19,11 @@ THRESHOLDS = {
     # A run whose exporters failed must never look green, and repeated partial failures must age out
     "collector_failed_exporters": (None, 1),
     "collector_last_success_age_h": (2, 26),
+    # Nightly trace retention (observatory.trace_retention): two failed nights in a row. Nothing is lost while it
+    # fails (rows only leave after every check), the table just grows again, so no alert level
+    "trace_retention_last_ok_age_h": (48, None),
 }
+TRACE_RETENTION_STATUS = "trace_retention.json"  # trace_retention --status writes it into TELEMETRY_DIR
 STUCK_GAP_LINES = 50
 NONE_IS_ALERT = {"collector_last_success_age_h"}  # "never succeeded" is the worst case, not "no data"
 
@@ -99,12 +104,29 @@ def values(db, now, disk_paths):
     return out
 
 
+def trace_retention_age_h(telemetry_dir, now):
+    """Hours since the last real retention run that exited 0, or since its first run while none has; None when
+    retention doesn't run here (no status file). An unreadable status file counts from when it was written."""
+    path = os.path.join(telemetry_dir or "", TRACE_RETENTION_STATUS)
+    if not telemetry_dir or not os.path.isfile(path):
+        return None
+    try:
+        status = json.load(open(path))
+    except (OSError, ValueError):
+        status = None
+    status = status if isinstance(status, dict) else {}
+    since = (parse_ts(trace_retention.last_ok(status)) or parse_ts(status.get("since")) or parse_ts(status.get("started_at"))
+             or datetime.datetime.fromtimestamp(os.path.getmtime(path), datetime.timezone.utc))
+    return max(0.0, (now - since).total_seconds() / 3600)
+
+
 def check(db, now, config, collector_errors=(), last_success_at=None):
     disk_paths = [p for p in (config.get("DISK_PATHS") or "/").split(",") if p]
     measured = values(db, now, disk_paths)
     measured["collector_failed_exporters"] = len(collector_errors)
     last_ok = parse_ts(last_success_at)
     measured["collector_last_success_age_h"] = (now - last_ok).total_seconds() / 3600 if last_ok else None
+    measured["trace_retention_last_ok_age_h"] = trace_retention_age_h(config.get("TELEMETRY_DIR"), now)
     checks = []
     for name, (warn, alert) in thresholds(config).items():
         value = measured.get(name)
