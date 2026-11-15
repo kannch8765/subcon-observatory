@@ -3,9 +3,10 @@
 Prints the fixture rows of the first table named in the query as CSV with a header. Also takes --delete's two writes:
 `delete from provider_traces t using (values ...) ... returning t.id` (rewrites the fixtures file, prints the deleted
 ids), `vacuum ...` (no-op; with "__vacuum_warning" in the fixtures it warns on stderr like PG does when it skips a
-table) and `select id from provider_traces where id in (...)` (`-A -t`: the ids that exist). Every query is appended
+table: `true` for PG's English text, a string for that text; held back when "__role_client_min_messages" is "error"
+and PGOPTIONS doesn't set its own) and `select id from provider_traces where id in (...)` (`-A -t`: the ids that exist). Every query is appended
 to <fixtures.json>.log, one per line."""
-import hashlib, json, re, sys
+import hashlib, json, os, re, sys
 
 fixtures_path = sys.argv[1]
 fixtures = json.load(open(fixtures_path))
@@ -25,8 +26,14 @@ if "from information_schema.columns" in query:  # `-A -t` column-name listing, o
     print("\n".join(fixtures[table][0]))
     sys.exit(0)
 if query.startswith("vacuum"):
-    if fixtures.get("__vacuum_warning"):
-        sys.stderr.write('WARNING:  permission denied to vacuum "provider_traces", skipping it\n')
+    warning = fixtures.get("__vacuum_warning")
+    if warning is True:
+        warning = 'WARNING:  permission denied to vacuum "provider_traces", skipping it'
+    # the role's client_min_messages (fixture "__role_client_min_messages"), unless the session's PGOPTIONS sets its own
+    level = re.findall(r"-c client_min_messages=(\w+)", os.environ.get("PGOPTIONS", ""))
+    level = level[-1] if level else fixtures.get("__role_client_min_messages", "notice")
+    if warning and level != "error":  # for client messages only error ranks above warning (log is below notice)
+        sys.stderr.write(warning + "\n")
     sys.exit(0)
 if query.startswith("select id from provider_traces where id in ("):
     wanted = set(re.findall(r"'([^']*)'", query))

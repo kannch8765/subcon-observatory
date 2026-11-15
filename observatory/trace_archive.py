@@ -617,11 +617,14 @@ def _delete_batch(config, batch, cutoff):
 def _vacuum(config):
     """Plain VACUUM: new rows reuse the space; the file doesn't shrink (that's VACUUM FULL, which locks the table).
     "done", or "warning" when the server warned: without the right privilege PG skips the table with a WARNING and
-    still succeeds. The server's text is never passed on."""
+    still succeeds. The session asks for warnings itself (a role set to client_min_messages=error would hide them)
+    and any stderr at all counts, since the server may word "WARNING" in its own language. The server's text is never
+    passed on."""
     cmd, env = _psql_write(config)
+    env["PGOPTIONS"] += " -c client_min_messages=warning"
     result = subprocess.run([*cmd, "-v", "ON_ERROR_STOP=1", "-c", "vacuum (analyze) provider_traces"], env=env,
                             capture_output=True, text=True, check=True)
-    return "warning" if "WARNING" in result.stderr else "done"
+    return "warning" if result.stderr.strip() else "done"
 
 
 def _present_ids(config, ids):
