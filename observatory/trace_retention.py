@@ -100,12 +100,13 @@ def snapshot(directory, offsite_dir, recipient, min_free_gb=ta.DEFAULT_MIN_FREE_
     if st.st_uid != os.getuid() or stat.S_IMODE(st.st_mode) & 0o077:
         raise RuntimeError(f"off-site directory must belong to uid {os.getuid()} with mode 700")
     manifest_path = os.path.join(offsite_dir, MANIFEST)
-    last = json.load(open(manifest_path)) if os.path.isfile(manifest_path) else {}
     plain = os.path.join(offsite_dir, ".snapshot.sqlite3")
     part = os.path.join(offsite_dir, f".{SNAPSHOT}.part")
     new, published = None, False
     db, path, lock = ta.open_archive(directory)  # its lock: no archive or delete run writes while we copy
     try:
+        # read under the lock: a run that published since we started is what the live manifest points to now
+        last = json.load(open(manifest_path)) if os.path.isfile(manifest_path) else {}
         for name in os.listdir(offsite_dir):
             if _GENERATION.match(name) and name != last.get("file"):
                 os.remove(os.path.join(offsite_dir, name))

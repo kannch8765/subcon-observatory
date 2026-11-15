@@ -15,8 +15,9 @@ RECIPIENT = "age1" + "q" * 58  # the fake age takes any recipient; main() checks
 
 @pytest.fixture
 def fake_age(tmp_path, monkeypatch):
-    """A stand-in for age: writes the age header, the recipient and the plaintext. Exits 1 when FAKE_AGE_FAIL is set;
-    with FAKE_AGE_GARBAGE it writes something that isn't an age file and still exits 0."""
+    """A stand-in for age: writes the age header, the recipient with a random nonce (real age picks a new file key each
+    time, so two encryptions of the same plaintext differ), and the plaintext. Exits 1 when FAKE_AGE_FAIL is set; with
+    FAKE_AGE_GARBAGE it writes something that isn't an age file and still exits 0."""
     script = tmp_path / "fake_age.py"
     script.write_text(f"#!{sys.executable}\n" + """import os, sys
 if os.environ.get("FAKE_AGE_FAIL"):
@@ -27,7 +28,8 @@ if os.environ.get("FAKE_AGE_GARBAGE"):
     open(out, "wb").write(b"not an age file")
     sys.exit(0)
 with open(out, "wb") as f:
-    f.write(b"age-encryption.org/v1\\n" + recipient.encode() + b"\\n" + open(args[-1], "rb").read())
+    f.write(b"age-encryption.org/v1\\n" + recipient.encode() + b" " + os.urandom(8).hex().encode() + b"\\n"
+            + open(args[-1], "rb").read())
 """)
     script.chmod(0o700)
     monkeypatch.setattr(tr, "AGE", str(script))
@@ -331,6 +333,29 @@ def test_a_manifest_that_cant_be_written_leaves_the_last_pair_usable(tmp_path, f
     code, _ = night(config, directory, offsite, status)
     assert code == 5 and json.loads(open(status).read())["snapshot"] == {"error": "OSError"}
     assert kept(offsite, before)  # the new generation and the half manifest are gone
+
+
+def test_a_run_that_published_while_we_waited_for_the_lock_keeps_its_file(tmp_path, fake_age, monkeypatch):
+    """Run A starts with a manifest naming G0; run B takes the archive lock first and publishes G1; then A gets the
+    lock and fails before it publishes. G1, which the live manifest names, must still be there."""
+    config, directory, offsite, status = daily(tmp_path)
+    night(config, directory, offsite, status)
+    g0 = published(offsite)[0]["file"]
+    real_open, raced = ta.open_archive, []
+
+    def open_after_run_b(directory):
+        if not raced:
+            raced.append(True)
+            tr.snapshot(directory, offsite, RECIPIENT, min_free_gb=0)  # run B, all the way, before A gets the lock
+            monkeypatch.setenv("FAKE_AGE_FAIL", "1")  # A then fails before it publishes
+        return real_open(directory)
+
+    monkeypatch.setattr(ta, "open_archive", open_after_run_b)
+    with pytest.raises(subprocess.CalledProcessError):
+        tr.snapshot(directory, offsite, RECIPIENT, min_free_gb=0)  # run A
+    g1 = published(offsite)[0]["file"]
+    assert raced and g1 != g0 and pair_usable(offsite)
+    assert sorted(os.listdir(offsite)) == sorted([g1, tr.MANIFEST])  # A removed G0 (not current), never G1
 
 
 def test_a_copy_that_fails_quick_check_never_replaces_the_last_snapshot(tmp_path, fake_age, monkeypatch):
