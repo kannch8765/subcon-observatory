@@ -44,6 +44,17 @@ def test_a_dry_run_is_not_a_good_retention_run(tmp_path):
     assert health.trace_retention_age_h(str(tmp_path), NOW) == 60 and level(60) == "warn"  # never succeeded: from `since`
 
 
+def test_a_dry_run_after_a_good_night_still_reports_that_night(tmp_path):
+    write_status(tmp_path, since=ago(300), last_ok_at=ago(20), finished_at=ago(1), exit=0, dry_run=True)
+    assert health.trace_retention_age_h(str(tmp_path), NOW) == 20
+
+
+def test_a_status_file_that_goes_away_mid_check_is_not_an_error(tmp_path, monkeypatch):
+    write_status(tmp_path, since=ago(10))
+    monkeypatch.setattr(health.os.path, "getmtime", lambda path: (_ for _ in ()).throw(FileNotFoundError(path)))
+    assert health.trace_retention_age_h(str(tmp_path), NOW) is None
+
+
 def test_a_status_from_before_the_carried_fields_still_works(tmp_path):
     write_status(tmp_path, started_at=ago(10.1), finished_at=ago(10), exit=0, dry_run=False)
     assert health.trace_retention_age_h(str(tmp_path), NOW) == 10

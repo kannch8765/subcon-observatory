@@ -170,11 +170,14 @@ it reads them back only in its debug API (a step's trace), which answers "not fo
 5. **Status**: `--status` writes the run's exits, both steps' counts (their `runs` rows), the manifest or the
    snapshot's error class, and an unexpected error's class, as JSON (mode 640), on every path. A delete that stops
    after its runs row keeps its counts there with `exit` null. Two fields carry over from the last status file:
-   `last_ok_at` (when the last real run that exited 0 finished; a dry run never counts) and `since` (the first run;
-   an unreadable file counts from when it was written). The collector's health check
-   `trace_retention_last_ok_age_h` reads `<TELEMETRY_DIR>/trace_retention.json` and warns at 48 h: two failed nights
-   in a row, or a first real run that hasn't succeeded within two days. No alert level: while it fails nothing is
-   lost, the table only grows again.
+   `last_ok_at` (when the last real run that exited 0 finished; a dry run never counts) and `since` (the first run
+   of any kind, dry runs included; an unreadable file counts from when it was written). The collector's health check
+   `trace_retention_last_ok_age_h` reads `<TELEMETRY_DIR>/trace_retention.json`: hours since `last_ok_at`, or since
+   `since` while there is none. It warns at 48 h: two failed nights in a row, or no good real run within two days of
+   the first run (so a dry rehearsal starts that clock too). No alert level: while it fails nothing is lost, the table
+   only grows again, and warns show in the bot's digest without a ping. The collector runs at :17 and the night's run
+   starts at 04:40, so a good night normally resets the age before the next check; a run still going at 05:17 can show
+   one hour of warn.
 
 It prints counts, sizes and hashes only. An unexpected error prints its class name; the traceback goes to
 `retention-error.log` in the archive directory (root-only; don't print it without looking: a traceback may quote

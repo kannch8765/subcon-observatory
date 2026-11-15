@@ -20,8 +20,8 @@ holds at least as many verified rows as the last one.
 
 Prints counts, sizes and hashes only. An unexpected error prints its class name; its traceback goes to a root-only file
 in the archive directory. --status writes the run's exits and counts as JSON, plus `last_ok_at` (when the last real
-run that exited 0 finished) and `since` (the first run), both carried over from the last status: the health check
-warns when no real run has succeeded for 48 h.
+run that exited 0 finished) and `since` (the first run, dry or real), both carried over from the last status: the
+health check warns when no real run has succeeded for 48 h.
 
 Exit codes: 0 all good; 3 --archive stopped for disk space (nothing deleted); 4 --archive or --delete reported rows that
 need a look, or the VACUUM failed or warned (see their output); 5 the snapshot failed (the deletes stand, the last
@@ -63,16 +63,21 @@ def last_ok(status):
     0 is that run itself; otherwise its carried `last_ok_at` (status files from before that field have none)."""
     if not isinstance(status, dict):
         return None
-    if status.get("exit") == 0 and status.get("dry_run") is False:
-        return status.get("finished_at")
-    return status.get("last_ok_at")
+    value = status.get("finished_at") if status.get("exit") == 0 and status.get("dry_run") is False \
+        else status.get("last_ok_at")
+    try:  # only a real timestamp is carried on: anything else would be copied forward forever
+        datetime.datetime.fromisoformat(value)
+    except (TypeError, ValueError):
+        return None
+    return value
 
 
 def _carried(status_path, status):
     """`since` and `last_ok_at` from the last status file into this one. An unreadable file counts from when it was
     written; a missing one makes this run the first."""
     try:
-        previous = json.load(open(status_path))
+        with open(status_path) as f:
+            previous = json.load(f)
     except FileNotFoundError:
         previous = {}
     except (OSError, ValueError):

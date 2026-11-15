@@ -537,3 +537,21 @@ def test_an_unreadable_status_counts_from_when_it_was_written(tmp_path, fake_age
     s = json.loads(open(status).read())
     assert s["last_ok_at"] is None
     assert s["since"] == datetime.datetime.fromtimestamp(1_700_000_000, datetime.timezone.utc).isoformat(timespec="seconds")
+
+
+def test_a_dry_run_after_a_good_night_keeps_the_last_good_run(tmp_path, fake_age):
+    config, directory, offsite, status = daily(tmp_path)
+    night(config, directory, offsite, status)
+    good = json.loads(open(status).read())
+    night(config, directory, offsite, status, dry_run=True)
+    dry = json.loads(open(status).read())
+    assert dry["dry_run"] is True and dry["exit"] == 0 and dry["last_ok_at"] == good["finished_at"]
+
+
+def test_a_carried_value_that_isnt_a_timestamp_is_dropped(tmp_path, fake_age, monkeypatch):
+    config, directory, offsite, status = daily(tmp_path)
+    open(status, "w").write(json.dumps({"since": "2026-11-01T00:00:00+00:00", "last_ok_at": "yesterday-ish", "exit": 5}))
+    monkeypatch.setenv("FAKE_AGE_FAIL", "1")
+    night(config, directory, offsite, status)
+    s = json.loads(open(status).read())
+    assert (s["last_ok_at"], s["since"]) == (None, "2026-11-01T00:00:00+00:00")

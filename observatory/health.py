@@ -107,16 +107,21 @@ def values(db, now, disk_paths):
 def trace_retention_age_h(telemetry_dir, now):
     """Hours since the last real retention run that exited 0, or since its first run while none has; None when
     retention doesn't run here (no status file). An unreadable status file counts from when it was written."""
-    path = os.path.join(telemetry_dir or "", TRACE_RETENTION_STATUS)
-    if not telemetry_dir or not os.path.isfile(path):
+    if not telemetry_dir:
+        return None
+    path = os.path.join(telemetry_dir, TRACE_RETENTION_STATUS)
+    try:
+        written = datetime.datetime.fromtimestamp(os.path.getmtime(path), datetime.timezone.utc)
+    except OSError:  # no status file (or it went away just now): retention isn't set up here
         return None
     try:
-        status = json.load(open(path))
+        with open(path) as f:
+            status = json.load(f)
     except (OSError, ValueError):
         status = None
     status = status if isinstance(status, dict) else {}
-    since = (parse_ts(trace_retention.last_ok(status)) or parse_ts(status.get("since")) or parse_ts(status.get("started_at"))
-             or datetime.datetime.fromtimestamp(os.path.getmtime(path), datetime.timezone.utc))
+    since = (parse_ts(trace_retention.last_ok(status)) or parse_ts(status.get("since"))
+             or parse_ts(status.get("started_at")) or written)
     return max(0.0, (now - since).total_seconds() / 3600)
 
 
