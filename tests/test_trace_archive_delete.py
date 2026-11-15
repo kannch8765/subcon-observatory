@@ -262,7 +262,8 @@ def test_a_vacuum_the_server_skips_with_a_warning_is_not_done(tmp_path):
 @pytest.mark.parametrize("fixtures", [
     {"__vacuum_warning": '警告:  "provider_traces"をVACUUMする権限がありません、スキップします'},  # lc_messages=ja
     {"__vacuum_warning": True, "__role_client_min_messages": "error"},  # the role hides warnings by default
-], ids=["localized", "role_hides_warnings"])
+    {"__vacuum_warning": True, "__dsn_client_min_messages": "error"},  # so does a connection string's own options
+], ids=["localized", "role_hides_warnings", "connection_options_hide_warnings"])
 def test_a_vacuum_warning_counts_in_any_language_and_whatever_the_role_default(tmp_path, fixtures):
     config, directory, rows = archived(tmp_path)
     (tmp_path / "letta.json").write_text(json.dumps({"provider_traces": rows, **fixtures}))
