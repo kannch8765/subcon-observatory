@@ -99,8 +99,10 @@ def last_ok(status, now):
 
 def first_seen(status, written, now):
     """Where the retention clock starts for a status: its `since`, else its `started_at` (files from before `since`),
-    else when the file was written. Only real timestamps no later than `now` + CLOCK_SKEW count."""
-    return _usable(status.get("since"), now) or _usable(status.get("started_at"), now) or written
+    else when the file was written (its mtime). Each counts only if it's no later than `now` + CLOCK_SKEW; None when
+    none does (the file holds no clock this reader can trust)."""
+    return (_usable(status.get("since"), now) or _usable(status.get("started_at"), now)
+            or (written if written and written <= now + CLOCK_SKEW else None))
 
 
 def read_status(path):
@@ -129,6 +131,8 @@ def _publish_status(status_path, status):
         now = _clock()  # under the lock: a concurrent run's success, published before this, is never "future"
         previous, written = read_status(status_path)
         start = timestamp(status["started_at"])
+        # a file whose whole clock is later than ours (written while the clock ran ahead) restarts it at this run,
+        # which is itself evidence of the right time; a missing file makes this run the first
         before = first_seen(previous, written, now) if written else None
         status["since"] = min(before, start).isoformat() if before else status["started_at"]
         newest = [(t, v) for v in (last_ok(previous, now), last_ok({**status, "last_ok_at": None}, now))

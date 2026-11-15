@@ -179,7 +179,11 @@ it reads them back only in its debug API (a step's trace), which answers "not fo
    happen under one lock (`trace_retention.json.lock`), so a run that read an older status never overwrites a newer
    one's success. The collector's health check
    `trace_retention_last_ok_age_h` reads `<TELEMETRY_DIR>/trace_retention.json`: hours since `last_ok_at`, or since
-   `since` while there is none, with the same reader (a bad status file never stops the healthcheck). It warns at 48 h: two failed nights in a row, or no good real run within two days of
+   `since` while there is none, with the same reader (a bad status file never stops the healthcheck). The clock rule
+   covers every age source, the file's mtime included: when a present file holds no usable clock at all (written
+   while the clock ran ahead, and nothing has rewritten it since), the check is **warn with no value** and
+   `health.json` says `info.trace_retention_clock: "untrusted"`, at every check until a run writes a status with the
+   right time (that run restarts the clock at its own start). It warns at 48 h: two failed nights in a row, or no good real run within two days of
    the first run (so a dry rehearsal starts that clock too). No alert level: while it fails nothing is lost, the table
    only grows again, and warns show in the bot's digest without a ping. The collector runs at :17 and the night's run
    starts at 04:40, so a good night normally resets the age before the next check; a run still going at 05:17 can show

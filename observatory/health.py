@@ -24,6 +24,9 @@ THRESHOLDS = {
     "trace_retention_last_ok_age_h": (48, None),
 }
 TRACE_RETENTION_STATUS = "trace_retention.json"  # trace_retention --status writes it into TELEMETRY_DIR
+# A status file is there, but every clock in it (last success, since, started_at, and the file's own mtime) is later
+# than now + trace_retention.CLOCK_SKEW: no age can be trusted. Reported as warn with no value, never as "0 h".
+UNTRUSTED_CLOCK = "untrusted"
 STUCK_GAP_LINES = 50
 NONE_IS_ALERT = {"collector_last_success_age_h"}  # "never succeeded" is the worst case, not "no data"
 
@@ -107,8 +110,9 @@ def values(db, now, disk_paths):
 def trace_retention_age_h(telemetry_dir, now):
     """Hours since the last real retention run that exited 0, or since its first run while none has; None when
     retention doesn't run here (no status file). A status file that can't be read as a JSON object counts from when it
-    was written (trace_retention.read_status), so a damaged file warns in time and never stops the healthcheck; a
-    timestamp later than `now` + trace_retention.CLOCK_SKEW is ignored, so a future-dated success can't hide failures."""
+    was written (trace_retention.read_status), so a damaged file warns in time and never stops the healthcheck. A
+    timestamp later than `now` + trace_retention.CLOCK_SKEW is ignored, so a future-dated success can't hide failures;
+    when nothing in a present file is usable, UNTRUSTED_CLOCK (a visible warn), never an age of 0."""
     if not telemetry_dir:
         return None
     status, written = trace_retention.read_status(os.path.join(telemetry_dir, TRACE_RETENTION_STATUS))
@@ -116,7 +120,9 @@ def trace_retention_age_h(telemetry_dir, now):
         return None
     since = (trace_retention.timestamp(trace_retention.last_ok(status, now))
              or trace_retention.first_seen(status, written, now))
-    return max(0.0, (now - since).total_seconds() / 3600)
+    if since is None:
+        return UNTRUSTED_CLOCK
+    return max(0.0, (now - since).total_seconds() / 3600)  # at most CLOCK_SKEW ahead: never more than minutes of 0
 
 
 def check(db, now, config, collector_errors=(), last_success_at=None):
@@ -125,14 +131,18 @@ def check(db, now, config, collector_errors=(), last_success_at=None):
     measured["collector_failed_exporters"] = len(collector_errors)
     last_ok = parse_ts(last_success_at)
     measured["collector_last_success_age_h"] = (now - last_ok).total_seconds() / 3600 if last_ok else None
-    measured["trace_retention_last_ok_age_h"] = trace_retention_age_h(config.get("TELEMETRY_DIR"), now)
+    retention_age = trace_retention_age_h(config.get("TELEMETRY_DIR"), now)
+    untrusted = retention_age == UNTRUSTED_CLOCK
+    measured["trace_retention_last_ok_age_h"] = None if untrusted else retention_age
+    forced = {"trace_retention_last_ok_age_h": "warn"} if untrusted else {}
     checks = []
     for name, (warn, alert) in thresholds(config).items():
         value = measured.get(name)
-        lvl = "alert" if value is None and name in NONE_IS_ALERT else level(value, warn, alert)
+        lvl = forced.get(name) or ("alert" if value is None and name in NONE_IS_ALERT else level(value, warn, alert))
         checks.append({"name": name, "level": lvl, "value": round(value, 4) if isinstance(value, float) else value,
                        "warn": warn, "alert": alert})
     overall = max((c["level"] for c in checks), key=LEVELS.index, default="ok")
     return {"schema": "subcon_health_v1", "generated_at": now.isoformat(), "last_success_at": last_success_at,
             "overall": overall, "checks": checks,
-            "info": {"unresolved_intents": measured["unresolved_intents"]}}
+            "info": {"unresolved_intents": measured["unresolved_intents"],
+                     **({"trace_retention_clock": UNTRUSTED_CLOCK} if untrusted else {})}}

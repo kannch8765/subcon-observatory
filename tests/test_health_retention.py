@@ -94,3 +94,47 @@ def test_a_status_nested_too_deep_never_stops_the_collector(deployment, tmp_path
 def test_an_invalid_since_falls_back_to_a_valid_start(tmp_path):
     write_status(tmp_path, since="broken", started_at=ago(72), finished_at=ago(71.9), exit=5, dry_run=False)
     assert health.trace_retention_age_h(str(tmp_path), NOW) == 72
+
+
+def future_status(tdir, days_ahead=30):
+    """A status written while the clock ran `days_ahead` days fast: JSON timestamps and the file's mtime alike."""
+    ahead = NOW + datetime.timedelta(days=days_ahead)
+    path = write_status(tdir, since=ahead.isoformat(), started_at=ahead.isoformat(), finished_at=ahead.isoformat(),
+                        last_ok_at=ahead.isoformat(), exit=0, dry_run=False)
+    os.utime(path, (ahead.timestamp(), ahead.timestamp()))
+    return path
+
+
+def test_a_file_with_no_usable_clock_is_untrusted_not_zero(tmp_path):
+    future_status(tmp_path)
+    assert health.trace_retention_age_h(str(tmp_path), NOW) == health.UNTRUSTED_CLOCK
+
+
+def test_future_json_with_a_real_mtime_counts_from_the_mtime(tmp_path):
+    path = future_status(tmp_path)
+    written = (NOW - datetime.timedelta(hours=50)).timestamp()
+    os.utime(path, (written, written))
+    assert round(health.trace_retention_age_h(str(tmp_path), NOW), 6) == 50
+
+
+def test_the_collector_warns_on_an_untrusted_clock_at_every_check_while_nothing_rewrites_it(deployment, tmp_path):
+    """The clock was corrected after the status was written and no run has written one since (the timer stopped, or
+    the run can't write): every check must stay visibly warn, never report 0 h."""
+    config = config_for(deployment, tmp_path)
+    future_status(tmp_path / "telemetry")
+    assert collect.run(config, since="2026-10-01", now=NOW)[0]
+    for later in (datetime.timedelta(0), datetime.timedelta(hours=48), datetime.timedelta(hours=96),
+                  datetime.timedelta(days=29)):
+        assert collect.run(config, now=NOW + later)[0]
+        report = json.loads((tmp_path / "telemetry" / "health.json").read_text())
+        c = next(c for c in report["checks"] if c["name"] == "trace_retention_last_ok_age_h")
+        assert (c["level"], c["value"]) == ("warn", None), later
+        assert report["info"]["trace_retention_clock"] == "untrusted"
+
+
+def test_a_trusted_clock_reports_no_clock_info(deployment, tmp_path):
+    config = config_for(deployment, tmp_path)
+    write_status(tmp_path / "telemetry", since=ago(10), last_ok_at=ago(5), finished_at=ago(5), exit=0, dry_run=False)
+    assert collect.run(config, since="2026-10-01", now=NOW)[0]
+    report = json.loads((tmp_path / "telemetry" / "health.json").read_text())
+    assert "trace_retention_clock" not in report["info"]

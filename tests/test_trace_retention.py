@@ -693,3 +693,18 @@ def test_a_future_dated_since_falls_back_to_a_real_start(tmp_path, monkeypatch):
     assert age_at(status, T) == pytest.approx(72)
     s = publish(status, T, monkeypatch, exit=5)
     assert tr.timestamp(s["since"]) == T - datetime.timedelta(hours=72)
+
+
+def test_a_run_over_a_file_with_no_usable_clock_restarts_it_once_then_warns(tmp_path, monkeypatch):
+    status = str(tmp_path / "trace_retention.json")
+    ahead = T + datetime.timedelta(days=30)
+    open(status, "w").write(json.dumps({"since": ahead.isoformat(), "last_ok_at": ahead.isoformat(),
+                                        "started_at": ahead.isoformat(), "exit": 0, "dry_run": False}))
+    os.utime(status, (ahead.timestamp(), ahead.timestamp()))
+    s = publish(status, T, monkeypatch, exit=5)  # the clock is right again; this run fails
+    assert s["last_ok_at"] is None and s["since"] == (T - datetime.timedelta(minutes=4)).isoformat()
+    for night in range(1, 3):  # and the next nights fail too: the clock keeps running from that run
+        s = publish(status, T + datetime.timedelta(days=night), monkeypatch, exit=5)
+        assert s["since"] == (T - datetime.timedelta(minutes=4)).isoformat()
+    from observatory import health
+    assert health.level(age_at(status, T + datetime.timedelta(hours=48)), 48, None) == "warn"
