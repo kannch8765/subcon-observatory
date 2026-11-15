@@ -82,6 +82,7 @@ Implemented in `observatory/health.py`; tested in `tests/test_collect.py`.
 
 | collector: any exporter failed in this run | — | any |
 | collector: age of the last fully successful run (`last_success_at`) | > 2 h | > 26 h, or never |
+| trace retention: age of the last real nightly run that exited 0 (`trace_retention.json` in `TELEMETRY_DIR`; from its first run while none has; no file = not set up = ok; a file with no usable clock = warn, no value) | ≥ 48 h | — |
 
 A run with failed exporters still writes a fresh `health.json`, but it can never be green, and repeated partial
 failures age out through `last_success_at`. The collector can't report its own death, so the bot also alerts once if

@@ -500,3 +500,211 @@ def test_the_documented_retention_unit_verifies_without_any_diagnostic(tmp_path)
     result = subprocess.run(["systemd-analyze", "verify", str(tmp_path / "subcon-trace-retention.service"),
                              str(tmp_path / "subcon-trace-retention.timer")], capture_output=True, text=True)
     assert (result.returncode, result.stdout + result.stderr) == (0, "")  # the exit code alone hides ignored settings
+
+
+def test_the_status_carries_the_last_good_real_run_and_the_first_run(tmp_path, fake_age, monkeypatch):
+    config, directory, offsite, status = daily(tmp_path)
+    night(config, directory, offsite, status, dry_run=True)  # a dry run is never a good retention run
+    first = json.loads(open(status).read())
+    assert first["last_ok_at"] is None and first["since"] == first["started_at"]
+    night(config, directory, offsite, status)
+    good = json.loads(open(status).read())
+    assert good["last_ok_at"] == good["finished_at"] and good["since"] == first["since"]
+    monkeypatch.setenv("FAKE_AGE_FAIL", "1")  # the next night fails (snapshot, exit 5)
+    assert night(config, directory, offsite, status, now=NOW + datetime.timedelta(days=1))[0] == 5
+    failed = json.loads(open(status).read())
+    assert (failed["last_ok_at"], failed["since"]) == (good["finished_at"], first["since"])
+    assert tr.last_ok(failed, datetime.datetime.now(datetime.timezone.utc)) == good["finished_at"]
+
+
+def test_a_status_from_before_these_fields_still_counts_as_the_last_good_run(tmp_path, fake_age, monkeypatch):
+    config, directory, offsite, status = daily(tmp_path)
+    old = {"started_at": "2026-11-07T11:32:48+00:00", "finished_at": "2026-11-07T11:36:18+00:00", "exit": 0,
+           "dry_run": False}  # as written by the first release of trace_retention
+    open(status, "w").write(json.dumps(old))
+    monkeypatch.setenv("FAKE_AGE_FAIL", "1")
+    assert night(config, directory, offsite, status)[0] == 5
+    s = json.loads(open(status).read())
+    assert (s["last_ok_at"], s["since"]) == (old["finished_at"], old["started_at"])
+
+
+def test_an_unreadable_status_counts_from_when_it_was_written(tmp_path, fake_age, monkeypatch):
+    config, directory, offsite, status = daily(tmp_path)
+    open(status, "w").write("{not json")
+    os.utime(status, (1_700_000_000, 1_700_000_000))
+    monkeypatch.setenv("FAKE_AGE_FAIL", "1")
+    night(config, directory, offsite, status)
+    s = json.loads(open(status).read())
+    assert s["last_ok_at"] is None
+    assert s["since"] == datetime.datetime.fromtimestamp(1_700_000_000, datetime.timezone.utc).isoformat(timespec="seconds")
+
+
+def test_a_dry_run_after_a_good_night_keeps_the_last_good_run(tmp_path, fake_age):
+    config, directory, offsite, status = daily(tmp_path)
+    night(config, directory, offsite, status)
+    good = json.loads(open(status).read())
+    night(config, directory, offsite, status, dry_run=True)
+    dry = json.loads(open(status).read())
+    assert dry["dry_run"] is True and dry["exit"] == 0 and dry["last_ok_at"] == good["finished_at"]
+
+
+def test_a_carried_value_that_isnt_a_timestamp_is_dropped(tmp_path, fake_age, monkeypatch):
+    config, directory, offsite, status = daily(tmp_path)
+    open(status, "w").write(json.dumps({"since": "2026-11-01T00:00:00+00:00", "last_ok_at": "yesterday-ish", "exit": 5}))
+    monkeypatch.setenv("FAKE_AGE_FAIL", "1")
+    night(config, directory, offsite, status)
+    s = json.loads(open(status).read())
+    assert (s["last_ok_at"], s["since"]) == (None, "2026-11-01T00:00:00+00:00")
+
+
+def real_now():
+    return datetime.datetime.now(datetime.timezone.utc)  # status files hold wall-clock times (ta._now())
+
+
+def seed(status, text, hours_old):
+    open(status, "w").write(text)
+    written = (real_now() - datetime.timedelta(hours=hours_old)).timestamp()
+    os.utime(status, (written, written))
+
+
+def retention_age(status):
+    from observatory import health
+    return health.trace_retention_age_h(os.path.dirname(status), real_now())
+
+
+def test_an_invalid_carried_since_never_restarts_the_clock_over_failed_nights(tmp_path, fake_age, monkeypatch):
+    config, directory, offsite, status = daily(tmp_path)
+    old = (real_now() - datetime.timedelta(hours=72)).isoformat()
+    seed(status, json.dumps({"since": "broken", "started_at": old, "finished_at": old, "exit": 5, "dry_run": False}), 72)
+    assert retention_age(status) >= 72
+    monkeypatch.setenv("FAKE_AGE_FAIL", "1")
+    for n in range(3):  # three failed nights in a row: still warning, from the same start
+        assert night(config, directory, offsite, status, now=NOW + datetime.timedelta(days=n))[0] == 5
+        assert retention_age(status) >= 72
+        assert tr.timestamp(json.loads(open(status).read())["since"]) == tr.timestamp(old)
+
+
+@pytest.mark.parametrize("text", ["[1, 2]", '"just a string"', "{not json", "[" * 100_000])
+def test_a_status_that_isnt_a_readable_object_keeps_its_age_over_failed_nights(tmp_path, fake_age, monkeypatch, text):
+    config, directory, offsite, status = daily(tmp_path)
+    seed(status, text, 72)
+    assert retention_age(status) >= 72
+    monkeypatch.setenv("FAKE_AGE_FAIL", "1")
+    for n in range(2):
+        assert night(config, directory, offsite, status, now=NOW + datetime.timedelta(days=n))[0] == 5
+        assert retention_age(status) >= 72
+
+
+def publish(status, clock, monkeypatch, **fields):
+    """trace_retention's status publication with the merge's clock set to `clock`."""
+    monkeypatch.setattr(tr, "_clock", lambda: clock)
+    record = {"started_at": (clock - datetime.timedelta(minutes=4)).isoformat(), "finished_at": clock.isoformat(),
+              "exit": 0, "dry_run": False, **fields}
+    tr._publish_status(status, record)
+    return json.loads(open(status).read())
+
+
+def age_at(status, clock):
+    from observatory import health
+    return health.trace_retention_age_h(os.path.dirname(status), clock)
+
+
+T = datetime.datetime(2026, 11, 20, 4, 44, tzinfo=datetime.timezone.utc)
+
+
+def test_the_merge_keeps_a_concurrent_runs_newer_success(tmp_path, monkeypatch):
+    status = str(tmp_path / "trace_retention.json")
+    publish(status, T - datetime.timedelta(minutes=1), monkeypatch)  # B: finished after A, published first
+    s = publish(status, T, monkeypatch, finished_at=(T - datetime.timedelta(minutes=5)).isoformat())  # A, good
+    assert s["last_ok_at"] == (T - datetime.timedelta(minutes=1)).isoformat()
+    s = publish(status, T + datetime.timedelta(minutes=1), monkeypatch, exit=5)  # a late failure keeps it too
+    assert s["last_ok_at"] == (T - datetime.timedelta(minutes=1)).isoformat()
+
+
+def test_a_future_dated_success_never_hides_failures_once_the_clock_is_right(tmp_path, monkeypatch):
+    status = str(tmp_path / "trace_retention.json")
+    publish(status, T + datetime.timedelta(days=30), monkeypatch)  # recorded while the clock read 30 days ahead
+    s = publish(status, T, monkeypatch)  # the clock is right again: a correctly dated success
+    assert s["last_ok_at"] == T.isoformat()
+    for night in range(1, 5):  # then four failed nights
+        s = publish(status, T + datetime.timedelta(days=night), monkeypatch, exit=5)
+        assert s["last_ok_at"] == T.isoformat()
+    assert age_at(status, T + datetime.timedelta(hours=47.9)) == pytest.approx(47.9)
+    from observatory import health
+    warn, _ = health.thresholds({})["trace_retention_last_ok_age_h"]
+    assert health.level(age_at(status, T + datetime.timedelta(hours=48)), warn, None) == "warn"  # the boundary
+    assert age_at(status, T + datetime.timedelta(hours=96)) == pytest.approx(96)
+
+
+def test_a_future_dated_carried_success_falls_back_to_the_start(tmp_path, monkeypatch):
+    status = str(tmp_path / "trace_retention.json")
+    open(status, "w").write(json.dumps({"since": (T - datetime.timedelta(hours=72)).isoformat(),
+                                        "last_ok_at": (T + datetime.timedelta(days=30)).isoformat()}))
+    assert age_at(status, T) == pytest.approx(72)  # the reader ignores it
+    s = publish(status, T, monkeypatch, exit=5)  # and the writer doesn't carry it on
+    assert s["last_ok_at"] is None and age_at(status, T) == pytest.approx(72)
+
+
+def test_the_clock_skew_allowance_is_ten_minutes(tmp_path):
+    status = str(tmp_path / "trace_retention.json")
+    for ahead, counted in ((9, True), (11, False)):
+        open(status, "w").write(json.dumps({"since": (T - datetime.timedelta(hours=72)).isoformat(),
+                                            "last_ok_at": (T + datetime.timedelta(minutes=ahead)).isoformat()}))
+        assert (age_at(status, T) == 0) is counted
+
+
+def test_a_success_published_while_another_run_writes_its_status_is_never_lost(tmp_path, fake_age, monkeypatch):
+    """Run A failed its snapshot and is publishing its status; run B succeeds and publishes in between. B's success
+    must survive: the status read, merge and write happen under one lock."""
+    import threading
+    config, directory, offsite, status = daily(tmp_path)
+    old = (real_now() - datetime.timedelta(hours=72)).isoformat()
+    seed(status, json.dumps({"since": old, "last_ok_at": old, "exit": 5, "dry_run": False}), 72)
+    bad_offsite = tmp_path / "offsite-open"
+    bad_offsite.mkdir()
+    os.chmod(bad_offsite, 0o755)  # A's snapshot refuses a directory open to others: exit 5 (chmod: umask-proof)
+    real_read, b = tr.read_status, []
+
+    def run_b():
+        b.append(night(config, directory, offsite, status, now=NOW + datetime.timedelta(minutes=1)))
+
+    def read_then_let_b_publish(path):
+        got = real_read(path)
+        if not b and threading.current_thread() is threading.main_thread():
+            worker = threading.Thread(target=run_b)
+            worker.start()
+            worker.join(timeout=5)  # without the lock, B finishes and publishes here, before A writes
+            read_then_let_b_publish.worker = worker
+        return got
+
+    monkeypatch.setattr(tr, "read_status", read_then_let_b_publish)
+    assert night(config, directory, str(bad_offsite), status)[0] == 5  # run A
+    read_then_let_b_publish.worker.join(timeout=30)
+    assert b and b[0][0] == 0  # B succeeded
+    s = json.loads(open(status).read())
+    assert s["exit"] == 0 and tr.timestamp(s["last_ok_at"]) > real_now() - datetime.timedelta(minutes=5)
+    assert retention_age(status) < 1
+
+
+def test_a_future_dated_since_falls_back_to_a_real_start(tmp_path, monkeypatch):
+    status = str(tmp_path / "trace_retention.json")
+    open(status, "w").write(json.dumps({"since": (T + datetime.timedelta(days=30)).isoformat(),
+                                        "started_at": (T - datetime.timedelta(hours=72)).isoformat(), "exit": 5}))
+    assert age_at(status, T) == pytest.approx(72)
+    s = publish(status, T, monkeypatch, exit=5)
+    assert tr.timestamp(s["since"]) == T - datetime.timedelta(hours=72)
+
+
+def test_a_run_over_a_file_with_no_usable_clock_restarts_it_once_then_warns(tmp_path, monkeypatch):
+    status = str(tmp_path / "trace_retention.json")
+    ahead = T + datetime.timedelta(days=30)
+    open(status, "w").write(json.dumps({"since": ahead.isoformat(), "last_ok_at": ahead.isoformat(),
+                                        "started_at": ahead.isoformat(), "exit": 0, "dry_run": False}))
+    os.utime(status, (ahead.timestamp(), ahead.timestamp()))
+    s = publish(status, T, monkeypatch, exit=5)  # the clock is right again; this run fails
+    assert s["last_ok_at"] is None and s["since"] == (T - datetime.timedelta(minutes=4)).isoformat()
+    for night in range(1, 3):  # and the next nights fail too: the clock keeps running from that run
+        s = publish(status, T + datetime.timedelta(days=night), monkeypatch, exit=5)
+        assert s["since"] == (T - datetime.timedelta(minutes=4)).isoformat()
+    from observatory import health
+    assert health.level(age_at(status, T + datetime.timedelta(hours=48)), 48, None) == "warn"

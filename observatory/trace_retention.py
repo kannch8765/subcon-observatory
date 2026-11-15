@@ -19,13 +19,15 @@ every message they need still match their hashes (rows already deleted from Post
 holds at least as many verified rows as the last one.
 
 Prints counts, sizes and hashes only. An unexpected error prints its class name; its traceback goes to a root-only file
-in the archive directory. --status writes the run's exits and counts as JSON (for the health check).
+in the archive directory. --status writes the run's exits and counts as JSON, plus `last_ok_at` (when the last real
+run that exited 0 finished) and `since` (the first run, dry or real), both carried over from the last status: the
+health check warns when no real run has succeeded for 48 h.
 
 Exit codes: 0 all good; 3 --archive stopped for disk space (nothing deleted); 4 --archive or --delete reported rows that
 need a look, or the VACUUM failed or warned (see their output); 5 the snapshot failed (the deletes stand, the last
 snapshot is older); 1 an unexpected error.
 """
-import argparse, datetime, hashlib, json, os, re, shutil, sqlite3, stat, subprocess, sys, traceback, zoneinfo
+import argparse, datetime, fcntl, hashlib, json, os, re, shutil, sqlite3, stat, subprocess, sys, traceback, zoneinfo
 
 from observatory import trace_archive as ta
 from observatory.export import load_config
@@ -54,6 +56,90 @@ def _last_run(directory):
     finally:
         db.close()
     return args, json.loads(totals) if totals else None
+
+
+def timestamp(value):
+    """An ISO timestamp as an aware datetime (naive = UTC), else None."""
+    if not isinstance(value, str):
+        return None
+    try:
+        ts = datetime.datetime.fromisoformat(value)
+    except ValueError:
+        return None
+    return ts if ts.tzinfo else ts.replace(tzinfo=datetime.timezone.utc)
+
+
+# How far ahead of the reader's clock a timestamp may be and still count. A later one (a skewed clock when it was
+# written, or a damaged file) would win every "newest" comparison and hide failures, so it's ignored instead.
+CLOCK_SKEW = datetime.timedelta(minutes=10)
+
+
+def _clock():
+    return datetime.datetime.now(datetime.timezone.utc)
+
+
+def _usable(value, now):
+    """timestamp(value) if it isn't later than now + CLOCK_SKEW, else None."""
+    t = timestamp(value)
+    return t if t and t <= now + CLOCK_SKEW else None
+
+
+def last_ok(status, now):
+    """When the newest real run that exited 0 finished, as its ISO text, from a status dict; None if none is known.
+    Candidates: the run itself when it's a good real run, and its carried `last_ok_at` (status files from before that
+    field have none). Only real timestamps no later than `now` (the reader's clock) + CLOCK_SKEW count: anything else
+    would be copied forward forever."""
+    if not isinstance(status, dict):
+        return None
+    good = status.get("exit") == 0 and status.get("dry_run") is False
+    valid = [(t, v) for v in (status.get("last_ok_at"), status.get("finished_at") if good else None)
+             if (t := _usable(v, now))]
+    return max(valid)[1] if valid else None
+
+
+def first_seen(status, written, now):
+    """Where the retention clock starts for a status: its `since`, else its `started_at` (files from before `since`),
+    else when the file was written (its mtime). Each counts only if it's no later than `now` + CLOCK_SKEW; None when
+    none does (the file holds no clock this reader can trust)."""
+    return (_usable(status.get("since"), now) or _usable(status.get("started_at"), now)
+            or (written if written and written <= now + CLOCK_SKEW else None))
+
+
+def read_status(path):
+    """(status, when the file was written) for a status file; ({}, None) when there is none. Anything that isn't a
+    readable JSON object (damaged, another JSON type, nesting too deep to parse) is ({}, written): only its age is
+    known. The one reader for both this writer and the healthcheck, so neither can be stopped by a bad file."""
+    try:
+        written = datetime.datetime.fromtimestamp(os.path.getmtime(path), datetime.timezone.utc)
+    except OSError:
+        return {}, None
+    try:
+        with open(path) as f:
+            status = json.load(f)
+    except (OSError, ValueError, RecursionError):
+        return {}, written
+    return (status, written) if isinstance(status, dict) else ({}, written)
+
+
+def _publish_status(status_path, status):
+    """Merge the clocks with the last status file and write this one, both under the status lock, so a run that read
+    an older status can never overwrite a newer one: `last_ok_at` is the newest good real run either knows of, `since`
+    the earliest start, each checked against the clock at the merge (CLOCK_SKEW). Only a missing file makes this run
+    the first."""
+    with open(status_path + ".lock", "a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)  # held for one read and one write
+        now = _clock()  # under the lock: a concurrent run's success, published before this, is never "future"
+        previous, written = read_status(status_path)
+        start = timestamp(status["started_at"])
+        # a file whose whole clock is later than ours (written while the clock ran ahead) restarts it at this run,
+        # which is itself evidence of the right time; a missing file makes this run the first
+        before = first_seen(previous, written, now) if written else None
+        status["since"] = min(before, start).isoformat() if before else status["started_at"]
+        newest = [(t, v) for v in (last_ok(previous, now), last_ok({**status, "last_ok_at": None}, now))
+                  if (t := timestamp(v))]
+        status["last_ok_at"] = max(newest)[1] if newest else None
+        _write_json(status_path, status)
+        os.chmod(status_path, 0o640)  # as the collector's files in TELEMETRY_DIR
 
 
 def _sha256(path):
@@ -200,8 +286,7 @@ def run(config, directory, older_than_days=ta.DEFAULT_OLDER_THAN_DAYS, offsite_d
     status.update(finished_at=ta._now(), exit=code)
     if status_path:
         try:
-            _write_json(status_path, status)
-            os.chmod(status_path, 0o640)  # as the collector's files in TELEMETRY_DIR
+            _publish_status(status_path, status)
         except Exception as exc:
             out.write(f"== status not written: {type(exc).__name__}\n")
             error = error or exc  # never hides an earlier error
