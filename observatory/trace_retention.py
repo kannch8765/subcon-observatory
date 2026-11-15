@@ -11,9 +11,12 @@ than the cutoff stay whatever zone Postgres uses for days: the cutoff is in ever
 
 After a delete the archive holds the only copy of those rows. With --offsite-dir the run always ends (whatever happened
 before) with a consistent copy of the archive (SQLite's backup API, under the archive's lock) encrypted with age to the
-owner's public key, and a manifest of its sizes and sha256s for the pull to check. The server never holds the private
-key. The last snapshot is replaced only by a complete one that passes SQLite's quick_check and holds at least as many
-verified rows.
+owner's public key, in a file of its own (one generation per run), and a manifest that names that file with its sizes
+and sha256s. The manifest is the only pointer and is written last: until then the last snapshot and its manifest are
+untouched, and the one before stays on disk too (for a pull that is copying it). The server never holds the private
+key. A new snapshot is published only when its copy passes SQLite's quick_check, every verified trace's record and
+every message they need still match their hashes (rows already deleted from Postgres are checked nowhere else), and it
+holds at least as many verified rows as the last one.
 
 Prints counts, sizes and hashes only. An unexpected error prints its class name; its traceback goes to a root-only file
 in the archive directory. --status writes the run's exits and counts as JSON (for the health check).
@@ -29,6 +32,8 @@ from observatory.export import load_config
 
 SNAPSHOT = ta.ARCHIVE_DB + ".age"
 MANIFEST = SNAPSHOT + ".json"
+# one file per snapshot: provider_traces.<UTC time>-<first 12 hex of its sha256>.sqlite3.age
+_GENERATION = re.compile(r"^provider_traces\.\d{8}T\d{6}Z-[0-9a-f]{12}\.sqlite3\.age$")
 ERROR_LOG = "retention-error.log"
 AGE_HEADER = b"age-encryption.org/v1\n"
 _RECIPIENT = re.compile(r"^age1[02-9ac-hj-np-z]{58}$")  # an age X25519 public key (bech32)
@@ -67,25 +72,47 @@ def _write_json(path, value):
     os.replace(tmp, path)
 
 
+def check_restorable(reader):
+    """Every verified trace's record, then every message those records need, each distinct message once: what
+    --restore-day reads. Raises (KeyError / ValueError from load_record and load_message) at the first one that is
+    missing, doesn't decompress, or doesn't match its hash. Returns (traces, messages) checked."""
+    ids = [trace_id for (trace_id,) in reader.execute("select id from traces where verified_at is not null")]
+    needed = set()
+    for trace_id in ids:
+        status, record = ta.load_record(reader, trace_id)
+        if status == "split":
+            needed.update(record["message_hashes"])
+    for digest in needed:
+        ta.load_message(reader, digest)
+    return len(ids), len(needed)
+
+
 def snapshot(directory, offsite_dir, recipient, min_free_gb=ta.DEFAULT_MIN_FREE_GB):
-    """Encrypt a consistent copy of the archive to `recipient` as offsite_dir/SNAPSHOT and write its manifest.
-    Returns the manifest. The plaintext copy exists only while it's encrypted and is removed on every path but a hard
-    kill (the next run removes it then). The last snapshot is kept when the copy fails SQLite's quick_check or holds
-    fewer verified rows than it (the archive only ever adds rows): a damaged or wrong archive never replaces it."""
+    """Encrypt a consistent copy of the archive to `recipient` as a new generation file in offsite_dir, then point the
+    manifest at it. Returns the manifest. Until the manifest is written the last pair stays as it was; a failure removes
+    whatever this run wrote. Generations other than the last one and the new one are removed first, to make room. The
+    plaintext copy exists only while it's checked and encrypted and is removed on every path but a hard kill (the next
+    run removes it then)."""
     if not os.path.isfile(os.path.join(directory, ta.ARCHIVE_DB)):  # open_archive would create an empty one
         raise RuntimeError("no archive in that directory")
     os.makedirs(offsite_dir, mode=0o700, exist_ok=True)  # as the archive's own directory (open_archive)
     st = os.stat(offsite_dir)
     if st.st_uid != os.getuid() or stat.S_IMODE(st.st_mode) & 0o077:
         raise RuntimeError(f"off-site directory must belong to uid {os.getuid()} with mode 700")
+    manifest_path = os.path.join(offsite_dir, MANIFEST)
+    last = json.load(open(manifest_path)) if os.path.isfile(manifest_path) else {}
     plain = os.path.join(offsite_dir, ".snapshot.sqlite3")
     part = os.path.join(offsite_dir, f".{SNAPSHOT}.part")
+    new, published = None, False
     db, path, lock = ta.open_archive(directory)  # its lock: no archive or delete run writes while we copy
     try:
+        for name in os.listdir(offsite_dir):
+            if _GENERATION.match(name) and name != last.get("file"):
+                os.remove(os.path.join(offsite_dir, name))
         for leftover in (plain, part):
             if os.path.exists(leftover):
                 os.remove(leftover)
-        # the plaintext copy and the new snapshot sit next to the last snapshot until it's replaced
+        # the plaintext copy and the new snapshot sit next to the last snapshot until the manifest moves
         if shutil.disk_usage(offsite_dir).free < 2 * os.path.getsize(path) + min_free_gb * 1e9:
             raise RuntimeError(f"not enough free space for the snapshot (keeps {min_free_gb:g} GB free)")
         ta._private_file(plain)
@@ -94,27 +121,34 @@ def snapshot(directory, offsite_dir, recipient, min_free_gb=ta.DEFAULT_MIN_FREE_
             db.backup(copy)
             if copy.execute("pragma quick_check").fetchall() != [("ok",)]:
                 raise RuntimeError("the archive's copy fails SQLite's quick_check")
-            rows, first, last = copy.execute("select count(*), min(day), max(day) from traces "
-                                             "where verified_at is not null").fetchone()
+            rows, messages = check_restorable(copy)
+            days = copy.execute("select min(day), max(day) from traces where verified_at is not null").fetchone()
         finally:
             copy.close()
-        manifest_path = os.path.join(offsite_dir, MANIFEST)
-        if os.path.isfile(manifest_path) and rows < json.load(open(manifest_path)).get("verified_rows", 0):
+        if rows < last.get("verified_rows", 0):
             raise RuntimeError("fewer verified rows than the last snapshot")
         manifest = {"created_at": ta._now(), "recipient": recipient, "plaintext_bytes": os.path.getsize(plain),
-                    "plaintext_sha256": _sha256(plain), "verified_rows": rows, "verified_days": [first, last]}
+                    "plaintext_sha256": _sha256(plain), "verified_rows": rows, "verified_days": list(days),
+                    "checked_messages": messages}
         subprocess.run([AGE, "--encrypt", "--recipient", recipient, "--output", part, plain],
                        capture_output=True, check=True)
         with open(part, "rb") as f:
             if f.read(len(AGE_HEADER)) != AGE_HEADER:
                 raise RuntimeError("age wrote no age file")
         os.chmod(part, 0o600)
-        manifest.update(bytes=os.path.getsize(part), sha256=_sha256(part))
-        os.replace(part, os.path.join(offsite_dir, SNAPSHOT))
-        _write_json(manifest_path, manifest)  # a stop right before this leaves the old manifest: the pull's check fails
+        digest = _sha256(part)
+        stamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        name = f"provider_traces.{stamp}-{digest[:12]}.sqlite3.age"
+        if name == last.get("file"):
+            raise RuntimeError("the new snapshot's name is the last one's")
+        manifest.update(file=name, bytes=os.path.getsize(part), sha256=digest)
+        new = os.path.join(offsite_dir, name)
+        os.replace(part, new)
+        _write_json(manifest_path, manifest)  # the pointer moves last, in one rename
+        published = True
         return manifest
     finally:
-        for leftover in (plain, part):
+        for leftover in (plain, part, manifest_path + ".tmp") + (() if published or new is None else (new,)):
             if os.path.exists(leftover):
                 os.remove(leftover)
         db.close()
@@ -145,15 +179,19 @@ def run(config, directory, older_than_days=ta.DEFAULT_OLDER_THAN_DAYS, offsite_d
         error, code = exc, 1
         status["error"] = type(exc).__name__
         if status["archive"] and not status["delete"]:  # the delete got as far as its runs row: keep its counts
-            args, totals = _last_run(directory)
-            if args.startswith("delete"):
-                status["delete"] = {"exit": None, "totals": totals}
+            try:  # best effort: nothing here may stop the snapshot and the status, or replace the error
+                args, totals = _last_run(directory)
+                if args.startswith("delete"):
+                    status["delete"] = {"exit": None, "totals": totals}
+            except Exception:
+                pass
     if offsite_dir:
         try:
             manifest = snapshot(directory, offsite_dir, recipient, min_free_gb)
             status["snapshot"] = manifest
             out.write(f"== snapshot: {manifest['verified_rows']} verified rows ({manifest['verified_days'][0]}.."
-                      f"{manifest['verified_days'][1]}), {manifest['bytes']} B, sha256 {manifest['sha256']}\n")
+                      f"{manifest['verified_days'][1]}) and {manifest['checked_messages']} messages checked; "
+                      f"{manifest['file']}, {manifest['bytes']} B, sha256 {manifest['sha256']}\n")
         except Exception as exc:
             status["snapshot"] = {"error": type(exc).__name__}
             out.write(f"== snapshot failed: {type(exc).__name__}; the last snapshot is older\n")
@@ -163,7 +201,7 @@ def run(config, directory, older_than_days=ta.DEFAULT_OLDER_THAN_DAYS, offsite_d
         try:
             _write_json(status_path, status)
             os.chmod(status_path, 0o640)  # as the collector's files in TELEMETRY_DIR
-        except OSError as exc:
+        except Exception as exc:
             out.write(f"== status not written: {type(exc).__name__}\n")
             error = error or exc  # never hides an earlier error
     if error:

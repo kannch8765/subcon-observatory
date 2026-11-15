@@ -151,15 +151,22 @@ it reads them back only in its debug API (a step's trace), which answers "not fo
 3. **`--delete`** through that day, only if `--archive` exited 0. It still re-checks every row itself (see step 3).
 4. **Snapshot**, always, whatever happened before (rows may already be gone): a consistent copy of the archive
    (SQLite's backup API, under the archive's lock, so no run writes meanwhile), encrypted with
-   [age](https://age-encryption.org) to the owner's public key into `--offsite-dir` as `provider_traces.sqlite3.age`,
-   plus `provider_traces.sqlite3.age.json`: its size and sha256, the plaintext's size and sha256, and the verified
-   rows and days it holds. The server never holds the private key. The last snapshot is replaced only by a complete
-   one: the copy passes SQLite's `quick_check`, holds at least as many verified rows as the last one (the archive only
-   ever adds rows, so fewer means a damaged or wrong archive), and age's output starts with age's header. A missing
-   archive is never snapshotted. The plaintext copy exists only while it's encrypted; a hard kill (timeout, OOM) can
-   leave it in the root-only directory until the next run removes it. Snapshot and manifest are two renames: a stop
-   between them leaves the old manifest, so the pull's sha256 check fails safe until the next night. The directory
-   must belong to the running user and be mode 700, like the archive's.
+   [age](https://age-encryption.org) to the owner's public key into `--offsite-dir`, one file per run
+   (`provider_traces.<UTC time>-<sha256 prefix>.sqlite3.age`). The server never holds the private key.
+   - **The manifest is the pointer.** `provider_traces.sqlite3.age.json` names the current file, with its size and
+     sha256, the plaintext's size and sha256, and the verified rows, days and messages it holds. It's written last,
+     in one rename. Until then the last file and manifest are untouched, so any failure (an exception or a kill) leaves
+     the last pair as it was; whatever the failed run wrote is removed (by the next run after a kill).
+   - The file before the current one stays until the next run, for a pull that started before the switch; older ones
+     are removed at the start of a run, to make room.
+   - **A new snapshot is published only if** the copy passes SQLite's `quick_check`; every verified trace's record, and
+     then every message those records need (each distinct message once), still decompresses and matches its hash, as
+     `--restore-day` reads them (the archive pass re-reads only rows still in Postgres, so rows already deleted are
+     checked nowhere else); it holds at least as many verified rows as the last one (the archive only ever adds rows);
+     and age's output starts with age's header. A missing archive is never snapshotted.
+   - The plaintext copy exists only while it's checked and encrypted; a hard kill (timeout, OOM) can leave it in the
+     root-only directory until the next run removes it.
+   - The directory must belong to the running user and be mode 700, like the archive's.
 5. **Status**: `--status` writes the run's exits, both steps' counts (their `runs` rows), the manifest or the
    snapshot's error class, and an unexpected error's class, as JSON (mode 640, for the health check), on every path.
    A delete that stops after its runs row keeps its counts there with `exit` null.
@@ -173,11 +180,13 @@ rows that need a look, or the VACUUM failed or warned (their own output says whi
 stand, the last snapshot is older); 1 an unexpected error. Any of them fails the unit. A `conflict` or `reread_failed`
 row (exit 4) holds every night's delete until someone looks, on purpose: the health check is to warn about it.
 
-**Off-site copy.** The owner pulls the snapshot to their own machine about weekly, checks its sha256 against the
-manifest, and keeps the previous one until the new one checks out; a decrypt check now and then compares the plaintext
-sha256. Between pulls, the newest rows' only copy is the archive on the server (their metrics are in telemetry).
+**Off-site copy.** The owner pulls the manifest and the file it names to their own machine about weekly, checks the
+file's size and sha256 against the manifest, and keeps the previous copy until the new one checks out; a decrypt check
+now and then compares the plaintext sha256. Between pulls, the newest rows' only copy is the archive on the server (their metrics are in telemetry).
 
-**Unit and timer** (`/etc/systemd/system/`), the collector's sandbox plus what the step 3 runs showed:
+**Unit and timer** (`/etc/systemd/system/`), the collector's sandbox plus what the step 3 runs showed. systemd takes
+only whole-line comments: a `# ...` after a value becomes part of it, and the setting is ignored with a warning
+(`systemd-analyze verify` still exits 0), so check its output, not only its exit code:
 
 ```ini
 # subcon-trace-retention.service
@@ -195,7 +204,8 @@ Nice=19
 IOSchedulingClass=idle
 ProtectSystem=strict
 ProtectHome=read-only
-PrivateTmp=yes                     # SQLite's spill files; psql reaches Postgres over TCP
+# SQLite's spill files; psql reaches Postgres over TCP
+PrivateTmp=yes
 # telemetry.db is in WAL mode: even a read-only open creates its -shm/-wal next to it, so the directory is writable
 # and the database file itself is not
 ReadWritePaths=<archive dir> <offsite dir> <TELEMETRY_DIR>
@@ -210,9 +220,12 @@ LockPersonality=yes
 CapabilityBoundingSet=CAP_DAC_READ_SEARCH
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
 IPAddressDeny=any
-IPAddressAllow=localhost           # Letta Postgres only
-MemoryMax=1500M                    # a first full --archive peaked at 993 MB; a normal night needs far less
-TimeoutStartSec=2h                 # a normal night takes minutes; this bounds a catch-up after a break
+# Letta Postgres only
+IPAddressAllow=localhost
+# a first full --archive peaked at 993 MB; a normal night needs far less
+MemoryMax=1500M
+# a normal night takes minutes; this bounds a catch-up after a break
+TimeoutStartSec=2h
 
 # subcon-trace-retention.timer
 [Unit]
