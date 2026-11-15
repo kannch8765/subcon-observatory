@@ -153,11 +153,16 @@ it reads them back only in its debug API (a step's trace), which answers "not fo
    (SQLite's backup API, under the archive's lock, so no run writes meanwhile), encrypted with
    [age](https://age-encryption.org) to the owner's public key into `--offsite-dir` as `provider_traces.sqlite3.age`,
    plus `provider_traces.sqlite3.age.json`: its size and sha256, the plaintext's size and sha256, and the verified
-   rows and days it holds. The server never holds the private key. The plaintext copy exists only while it's
-   encrypted; the last snapshot is replaced only once the new one is complete and starts with age's header. The
-   directory must belong to the running user and be mode 700, like the archive's.
+   rows and days it holds. The server never holds the private key. The last snapshot is replaced only by a complete
+   one: the copy passes SQLite's `quick_check`, holds at least as many verified rows as the last one (the archive only
+   ever adds rows, so fewer means a damaged or wrong archive), and age's output starts with age's header. A missing
+   archive is never snapshotted. The plaintext copy exists only while it's encrypted; a hard kill (timeout, OOM) can
+   leave it in the root-only directory until the next run removes it. Snapshot and manifest are two renames: a stop
+   between them leaves the old manifest, so the pull's sha256 check fails safe until the next night. The directory
+   must belong to the running user and be mode 700, like the archive's.
 5. **Status**: `--status` writes the run's exits, both steps' counts (their `runs` rows), the manifest or the
-   snapshot's error class, and an unexpected error's class, as JSON (mode 640, for the health check).
+   snapshot's error class, and an unexpected error's class, as JSON (mode 640, for the health check), on every path.
+   A delete that stops after its runs row keeps its counts there with `exit` null.
 
 It prints counts, sizes and hashes only. An unexpected error prints its class name; the traceback goes to
 `retention-error.log` in the archive directory (root-only; don't print it without looking: a traceback may quote
@@ -165,7 +170,8 @@ anything). `--dry-run` archives for real and runs `--delete --dry-run`.
 
 Exit codes: 0 all good; 3 `--archive` stopped for disk space (nothing deleted); 4 `--archive` or `--delete` reported
 rows that need a look, or the VACUUM failed or warned (their own output says which); 5 the snapshot failed (the deletes
-stand, the last snapshot is older); 1 an unexpected error. Any of them fails the unit.
+stand, the last snapshot is older); 1 an unexpected error. Any of them fails the unit. A `conflict` or `reread_failed`
+row (exit 4) holds every night's delete until someone looks, on purpose: the health check is to warn about it.
 
 **Off-site copy.** The owner pulls the snapshot to their own machine about weekly, checks its sha256 against the
 manifest, and keeps the previous one until the new one checks out; a decrypt check now and then compares the plaintext
@@ -189,6 +195,7 @@ Nice=19
 IOSchedulingClass=idle
 ProtectSystem=strict
 ProtectHome=read-only
+PrivateTmp=yes                     # SQLite's spill files; psql reaches Postgres over TCP
 # telemetry.db is in WAL mode: even a read-only open creates its -shm/-wal next to it, so the directory is writable
 # and the database file itself is not
 ReadWritePaths=<archive dir> <offsite dir> <TELEMETRY_DIR>
@@ -222,7 +229,8 @@ WantedBy=timers.target
 
 - 04:40 is inside the alert quiet hours and away from the collector's :17.
 - The archive and off-site directories must exist (mode 700) before the unit starts: systemd refuses a missing
-  `ReadWritePaths`.
+  `ReadWritePaths`. All three directories belong to root: the bounding set has no `CAP_DAC_OVERRIDE`, so root writes
+  only where it's the owner.
 - The checkout is pinned to a reviewed commit, as the collector's.
 
 ## Privacy

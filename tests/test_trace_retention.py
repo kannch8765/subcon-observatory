@@ -1,6 +1,6 @@
 """Trace archive step 4: the daily run archives, then deletes, whole days that left the window, and always ends with an
 encrypted snapshot of the archive and a status file."""
-import datetime, hashlib, io, json, os, shutil, sqlite3, stat, subprocess, sys
+import datetime, hashlib, io, json, os, shutil, sqlite3, stat, subprocess, sys, types
 
 import pytest
 
@@ -241,6 +241,88 @@ def test_snapshot_refuses_while_another_run_holds_the_archive_lock(tmp_path, fak
         db.close()
         lock.close()
     assert os.listdir(offsite) == []
+
+
+def test_a_missing_archive_is_never_snapshotted(tmp_path, fake_age):
+    _, directory, offsite, _ = daily(tmp_path)
+    with pytest.raises(RuntimeError, match="no archive"):
+        tr.snapshot(directory, offsite, RECIPIENT, min_free_gb=0)
+    assert os.listdir(directory) == [] and os.listdir(offsite) == []  # no empty archive created either
+
+
+def test_fewer_verified_rows_never_replace_the_last_snapshot(tmp_path, fake_age):
+    config, directory, offsite, status = daily(tmp_path)
+    night(config, directory, offsite, status)
+    before = sha256(os.path.join(offsite, tr.SNAPSHOT))
+    db = archive_db(directory)
+    with db:
+        db.execute("update traces set verified_at = null where id = 'a'")  # e.g. a damaged or older archive
+    code, _ = night(config, directory, offsite, status)
+    assert code == 5 and json.loads(open(status).read())["snapshot"] == {"error": "RuntimeError"}
+    assert sha256(os.path.join(offsite, tr.SNAPSHOT)) == before
+    assert sorted(os.listdir(offsite)) == [tr.SNAPSHOT, tr.MANIFEST]
+
+
+def test_a_copy_that_fails_quick_check_never_replaces_the_last_snapshot(tmp_path, fake_age, monkeypatch):
+    config, directory, offsite, status = daily(tmp_path)
+    night(config, directory, offsite, status)
+    before = sha256(os.path.join(offsite, tr.SNAPSHOT))
+
+    class Damaged(sqlite3.Connection):
+        def execute(self, sql, *args):
+            return super().execute("select 'page 2: btree damaged'" if sql == "pragma quick_check" else sql, *args)
+
+    monkeypatch.setattr(tr, "sqlite3", types.SimpleNamespace(
+        connect=lambda *a, **k: sqlite3.connect(*a, factory=Damaged, **k)))
+    code, _ = night(config, directory, offsite, status)
+    assert code == 5 and sha256(os.path.join(offsite, tr.SNAPSHOT)) == before
+    assert sorted(os.listdir(offsite)) == [tr.SNAPSHOT, tr.MANIFEST]
+
+
+def test_an_error_while_copying_removes_the_plaintext(tmp_path, fake_age, monkeypatch):
+    config, directory, offsite, status = daily(tmp_path)
+
+    def broken(path):
+        assert os.path.exists(path)  # the plaintext copy is there at this point
+        raise OSError("disk trouble")
+
+    monkeypatch.setattr(tr, "_sha256", broken)
+    code, _ = night(config, directory, offsite, status)
+    assert code == 5 and json.loads(open(status).read())["snapshot"] == {"error": "OSError"}
+    assert os.listdir(offsite) == []
+
+
+def test_a_bad_zone_still_snapshots_and_writes_the_status(tmp_path, fake_age):
+    config, directory, offsite, status = daily(tmp_path)
+    archive_run(config, directory)
+    with pytest.raises(Exception) as raised:
+        night({**config, "TELEMETRY_TZ": "Nowhere/Nope"}, directory, offsite, status)
+    s = json.loads(open(status).read())
+    assert (s["error"], s["exit"], s["last_day"], s["archive"]) == (type(raised.value).__name__, 1, None, None)
+    assert s["snapshot"]["verified_rows"] == 4
+    assert postgres_ids(tmp_path) == ["a", "b", "bad", "c", "d", "new"]
+
+
+def test_a_delete_that_stops_after_deleting_keeps_its_counts(tmp_path, fake_age, monkeypatch):
+    config, directory, offsite, status = daily(tmp_path)
+
+    def vacuum_crash(config):
+        raise RuntimeError("stopped")
+
+    monkeypatch.setattr(ta, "_vacuum", vacuum_crash)
+    with pytest.raises(RuntimeError):
+        night(config, directory, offsite, status)
+    s = json.loads(open(status).read())
+    assert postgres_ids(tmp_path) == ["bad", "new"]
+    assert (s["delete"]["exit"], s["delete"]["totals"]["deleted"], s["delete"]["totals"]["vacuum"]) == (None, 4, "pending")
+    assert s["snapshot"]["verified_rows"] == 4
+
+
+def test_a_status_that_cant_be_written_fails_the_run_after_the_snapshot(tmp_path, fake_age):
+    config, directory, offsite, _ = daily(tmp_path)
+    with pytest.raises(FileNotFoundError):
+        night(config, directory, offsite, str(tmp_path / "no-such-dir" / "status.json"))
+    assert json.loads(open(os.path.join(offsite, tr.MANIFEST)).read())["verified_rows"] == 4
 
 
 @pytest.mark.skipif(not (shutil.which("age") and shutil.which("age-keygen")), reason="needs age and age-keygen")

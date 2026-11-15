@@ -12,7 +12,8 @@ than the cutoff stay whatever zone Postgres uses for days: the cutoff is in ever
 After a delete the archive holds the only copy of those rows. With --offsite-dir the run always ends (whatever happened
 before) with a consistent copy of the archive (SQLite's backup API, under the archive's lock) encrypted with age to the
 owner's public key, and a manifest of its sizes and sha256s for the pull to check. The server never holds the private
-key. The last snapshot is replaced only once the new one is complete.
+key. The last snapshot is replaced only by a complete one that passes SQLite's quick_check and holds at least as many
+verified rows.
 
 Prints counts, sizes and hashes only. An unexpected error prints its class name; its traceback goes to a root-only file
 in the archive directory. --status writes the run's exits and counts as JSON (for the health check).
@@ -40,13 +41,14 @@ def last_day(config, older_than_days, now):
     return (now.astimezone(tz) - datetime.timedelta(days=older_than_days + 1)).date().isoformat()
 
 
-def _last_run_totals(directory):
+def _last_run(directory):
+    """(args, totals) of the archive's newest run; totals is None while that run hasn't finished."""
     db = sqlite3.connect(f"file:{os.path.join(directory, ta.ARCHIVE_DB)}?mode=ro", uri=True)
     try:
-        got = db.execute("select totals from runs order by run desc limit 1").fetchone()
+        args, totals = db.execute("select args, totals from runs order by run desc limit 1").fetchone()
     finally:
         db.close()
-    return json.loads(got[0]) if got and got[0] else None
+    return args, json.loads(totals) if totals else None
 
 
 def _sha256(path):
@@ -67,7 +69,11 @@ def _write_json(path, value):
 
 def snapshot(directory, offsite_dir, recipient, min_free_gb=ta.DEFAULT_MIN_FREE_GB):
     """Encrypt a consistent copy of the archive to `recipient` as offsite_dir/SNAPSHOT and write its manifest.
-    Returns the manifest. The plaintext copy exists only while it's encrypted and is always removed."""
+    Returns the manifest. The plaintext copy exists only while it's encrypted and is removed on every path but a hard
+    kill (the next run removes it then). The last snapshot is kept when the copy fails SQLite's quick_check or holds
+    fewer verified rows than it (the archive only ever adds rows): a damaged or wrong archive never replaces it."""
+    if not os.path.isfile(os.path.join(directory, ta.ARCHIVE_DB)):  # open_archive would create an empty one
+        raise RuntimeError("no archive in that directory")
     os.makedirs(offsite_dir, mode=0o700, exist_ok=True)  # as the archive's own directory (open_archive)
     st = os.stat(offsite_dir)
     if st.st_uid != os.getuid() or stat.S_IMODE(st.st_mode) & 0o077:
@@ -86,10 +92,15 @@ def snapshot(directory, offsite_dir, recipient, min_free_gb=ta.DEFAULT_MIN_FREE_
         copy = sqlite3.connect(plain)
         try:
             db.backup(copy)
+            if copy.execute("pragma quick_check").fetchall() != [("ok",)]:
+                raise RuntimeError("the archive's copy fails SQLite's quick_check")
             rows, first, last = copy.execute("select count(*), min(day), max(day) from traces "
                                              "where verified_at is not null").fetchone()
         finally:
             copy.close()
+        manifest_path = os.path.join(offsite_dir, MANIFEST)
+        if os.path.isfile(manifest_path) and rows < json.load(open(manifest_path)).get("verified_rows", 0):
+            raise RuntimeError("fewer verified rows than the last snapshot")
         manifest = {"created_at": ta._now(), "recipient": recipient, "plaintext_bytes": os.path.getsize(plain),
                     "plaintext_sha256": _sha256(plain), "verified_rows": rows, "verified_days": [first, last]}
         subprocess.run([AGE, "--encrypt", "--recipient", recipient, "--output", part, plain],
@@ -100,7 +111,7 @@ def snapshot(directory, offsite_dir, recipient, min_free_gb=ta.DEFAULT_MIN_FREE_
         os.chmod(part, 0o600)
         manifest.update(bytes=os.path.getsize(part), sha256=_sha256(part))
         os.replace(part, os.path.join(offsite_dir, SNAPSHOT))
-        _write_json(os.path.join(offsite_dir, MANIFEST), manifest)
+        _write_json(manifest_path, manifest)  # a stop right before this leaves the old manifest: the pull's check fails
         return manifest
     finally:
         for leftover in (plain, part):
@@ -115,24 +126,28 @@ def run(config, directory, older_than_days=ta.DEFAULT_OLDER_THAN_DAYS, offsite_d
     """Archive, then (if that exited 0) delete, through last_day(); then the snapshot and the status. Returns the exit
     code; an unexpected error is raised after the snapshot and the status are written."""
     now = now or datetime.datetime.now(datetime.timezone.utc)  # one cutoff for both steps
-    day = last_day(config, older_than_days, now)
-    status = {"started_at": ta._now(), "last_day": day, "cutoff": ta.cutoff_time(older_than_days, now),
-              "dry_run": dry_run, "archive": None, "delete": None, "snapshot": None, "error": None}
-    out.write(f"== trace retention: rows older than {older_than_days} days, through {day}\n")
+    status = {"started_at": ta._now(), "last_day": None, "cutoff": None, "dry_run": dry_run, "archive": None,
+              "delete": None, "snapshot": None, "error": None}
     error = None
     try:
-        out.write("== archive\n")
+        day = status["last_day"] = last_day(config, older_than_days, now)
+        status["cutoff"] = ta.cutoff_time(older_than_days, now)
+        out.write(f"== trace retention: rows older than {older_than_days} days, through {day}\n== archive\n")
         code = ta.run_archive(config, directory, older_than_days, date_to=day, min_free_gb=min_free_gb, now=now, out=out)
-        status["archive"] = {"exit": code, "totals": _last_run_totals(directory)}
+        status["archive"] = {"exit": code, "totals": _last_run(directory)[1]}
         if code == 0:
             out.write("== delete\n")
             code = ta.run_delete(config, directory, older_than_days, date_to=day, dry_run=dry_run, now=now, out=out)
-            status["delete"] = {"exit": code, "totals": _last_run_totals(directory)}
+            status["delete"] = {"exit": code, "totals": _last_run(directory)[1]}
         else:
             out.write(f"== delete skipped: --archive exited {code}\n")
     except Exception as exc:  # rows may already be gone: the snapshot and the status still have to happen
         error, code = exc, 1
         status["error"] = type(exc).__name__
+        if status["archive"] and not status["delete"]:  # the delete got as far as its runs row: keep its counts
+            args, totals = _last_run(directory)
+            if args.startswith("delete"):
+                status["delete"] = {"exit": None, "totals": totals}
     if offsite_dir:
         try:
             manifest = snapshot(directory, offsite_dir, recipient, min_free_gb)
@@ -145,8 +160,12 @@ def run(config, directory, older_than_days=ta.DEFAULT_OLDER_THAN_DAYS, offsite_d
             code = code or 5
     status.update(finished_at=ta._now(), exit=code)
     if status_path:
-        _write_json(status_path, status)
-        os.chmod(status_path, 0o640)  # as the collector's files in TELEMETRY_DIR
+        try:
+            _write_json(status_path, status)
+            os.chmod(status_path, 0o640)  # as the collector's files in TELEMETRY_DIR
+        except OSError as exc:
+            out.write(f"== status not written: {type(exc).__name__}\n")
+            error = error or exc  # never hides an earlier error
     if error:
         raise error
     out.write(f"== exit {code}\n")
