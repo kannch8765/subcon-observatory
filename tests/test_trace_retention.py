@@ -1,0 +1,268 @@
+"""Trace archive step 4: the daily run archives, then deletes, whole days that left the window, and always ends with an
+encrypted snapshot of the archive and a status file."""
+import datetime, hashlib, io, json, os, shutil, sqlite3, stat, subprocess, sys
+
+import pytest
+
+from observatory import trace_archive as ta
+from observatory import trace_retention as tr
+from tests.test_trace_archive import request, row
+from tests.test_trace_archive_delete import postgres_ids, telemetry, write_rows
+from tests.test_trace_archive_store import NOW, SHARED, archive_db, fixture_rows, run as archive_run, setup
+
+RECIPIENT = "age1" + "q" * 58  # the fake age takes any recipient; main() checks the shape
+
+
+@pytest.fixture
+def fake_age(tmp_path, monkeypatch):
+    """A stand-in for age: writes the age header, the recipient and the plaintext. Exits 1 when FAKE_AGE_FAIL is set;
+    with FAKE_AGE_GARBAGE it writes something that isn't an age file and still exits 0."""
+    script = tmp_path / "fake_age.py"
+    script.write_text(f"#!{sys.executable}\n" + """import os, sys
+if os.environ.get("FAKE_AGE_FAIL"):
+    sys.exit(1)
+args = sys.argv[1:]
+out, recipient = args[args.index("--output") + 1], args[args.index("--recipient") + 1]
+if os.environ.get("FAKE_AGE_GARBAGE"):
+    open(out, "wb").write(b"not an age file")
+    sys.exit(0)
+with open(out, "wb") as f:
+    f.write(b"age-encryption.org/v1\\n" + recipient.encode() + b"\\n" + open(args[-1], "rb").read())
+""")
+    script.chmod(0o700)
+    monkeypatch.setattr(tr, "AGE", str(script))
+    return script
+
+
+def daily(tmp_path, rows=None, analysed=("a", "b", "c", "d", "bad", "new", "e", "f")):
+    """Postgres fixtures, an empty archive directory and telemetry: the state before a night's run."""
+    config, directory = setup(tmp_path, rows if rows is not None else fixture_rows())
+    config = {**config, "TELEMETRY_DIR": telemetry(tmp_path, analysed), "TELEMETRY_TZ": "Asia/Tokyo"}
+    offsite = tmp_path / "offsite"
+    offsite.mkdir(mode=0o700)
+    return config, directory, str(offsite), str(tmp_path / "telemetry" / "trace_retention.json")
+
+
+def night(config, directory, offsite, status, now=NOW, **kw):
+    out = io.StringIO()
+    code = tr.run(config, directory, offsite_dir=offsite, recipient=kw.pop("recipient", RECIPIENT), status_path=status,
+                  min_free_gb=0, now=now, out=out, **kw)
+    return code, out.getvalue()
+
+
+def sha256(path):
+    return hashlib.sha256(open(path, "rb").read()).hexdigest()
+
+
+def test_last_day_is_the_whole_day_before_the_cutoff_in_the_configured_zone():
+    now = datetime.datetime(2026, 11, 7, 20, 0, tzinfo=datetime.timezone.utc)  # 2026-11-08 05:00 in Tokyo
+    assert tr.last_day({"TELEMETRY_TZ": "Asia/Tokyo"}, 30, now) == "2026-10-08"
+    assert tr.last_day({"TELEMETRY_TZ": "UTC"}, 30, now) == "2026-10-07"
+    for zone in ("Asia/Tokyo", "UTC", "America/Los_Angeles"):  # the last day ends by the cutoff, in its own zone
+        tz = __import__("zoneinfo").ZoneInfo(zone)
+        end = datetime.datetime.fromisoformat(tr.last_day({"TELEMETRY_TZ": zone}, 30, now)).replace(tzinfo=tz)
+        assert end + datetime.timedelta(days=1) <= now - datetime.timedelta(days=30)
+
+
+def test_night_archives_deletes_and_snapshots(tmp_path, fake_age):
+    config, directory, offsite, status = daily(tmp_path)
+    code, out = night(config, directory, offsite, status)
+    assert code == 0 and out.endswith("== exit 0\n") and "VACUUM done" in out
+    assert postgres_ids(tmp_path) == ["bad", "new"]  # unarchivable and inside-the-window rows stay
+    s = json.loads(open(status).read())
+    assert (s["last_day"], s["archive"]["exit"], s["delete"]["exit"], s["exit"], s["error"]) == ("2026-10-08", 0, 0, 0, None)
+    assert (s["archive"]["totals"]["verified"], s["delete"]["totals"]["deleted"]) == (4, 4)
+    assert stat.S_IMODE(os.stat(status).st_mode) == 0o640
+    # The snapshot: complete, private, described by its manifest; no plaintext left behind
+    snap, manifest = os.path.join(offsite, tr.SNAPSHOT), json.loads(open(os.path.join(offsite, tr.MANIFEST)).read())
+    assert sorted(os.listdir(offsite)) == [tr.SNAPSHOT, tr.MANIFEST]
+    assert stat.S_IMODE(os.stat(snap).st_mode) == 0o600
+    assert (manifest["sha256"], manifest["bytes"]) == (sha256(snap), os.path.getsize(snap))
+    assert (manifest["verified_rows"], manifest["verified_days"], manifest["recipient"]) == (
+        4, ["2026-08-08", "2026-08-09"], RECIPIENT)
+    plain = open(snap, "rb").read().split(b"\n", 2)[2]  # the fake's header lines, then the plaintext copy
+    assert hashlib.sha256(plain).hexdigest() == manifest["plaintext_sha256"] == s["snapshot"]["plaintext_sha256"]
+    # The copy is a consistent archive that knows about the deletes
+    copy = tmp_path / "copy.sqlite3"
+    copy.write_bytes(plain)
+    db = sqlite3.connect(copy)
+    assert db.execute("select count(*) from deletions where outcome = 'deleted'").fetchone() == (4,)
+
+
+def test_whole_days_only_a_row_older_than_the_cutoff_waits_for_its_own_night(tmp_path, fake_age):
+    rows = [row("e", request(SHARED), created_at="2026-10-08 23:00:00+09"),
+            row("f", request(SHARED), created_at="2026-10-09 01:00:00+09")]  # older than the cutoff, on the next day
+    config, directory, offsite, status = daily(tmp_path, rows)
+    cutoff = datetime.datetime.fromisoformat(ta.cutoff_time(30, NOW))
+    assert datetime.datetime.fromisoformat("2026-10-09T01:00:00+09:00") < cutoff
+    assert night(config, directory, offsite, status)[0] == 0
+    assert postgres_ids(tmp_path) == ["f"]
+    assert night(config, directory, offsite, status, now=NOW + datetime.timedelta(days=1))[0] == 0
+    assert postgres_ids(tmp_path) == []
+    assert json.loads(open(status).read())["last_day"] == "2026-10-09"
+
+
+def test_a_second_run_the_same_night_finds_nothing_and_still_snapshots(tmp_path, fake_age):
+    config, directory, offsite, status = daily(tmp_path)
+    night(config, directory, offsite, status)
+    first = json.loads(open(os.path.join(offsite, tr.MANIFEST)).read())
+    code, _ = night(config, directory, offsite, status)
+    s = json.loads(open(status).read())
+    assert code == 0 and (s["archive"]["totals"]["new"], s["delete"]["totals"]["deleted"]) == (0, 0)
+    assert s["snapshot"]["verified_rows"] == first["verified_rows"] == 4
+
+
+def test_dry_run_archives_for_real_and_deletes_nothing(tmp_path, fake_age):
+    config, directory, offsite, status = daily(tmp_path)
+    code, out = night(config, directory, offsite, status, dry_run=True)
+    s = json.loads(open(status).read())
+    assert code == 0 and "dry run: nothing deleted" in out and s["dry_run"] is True
+    assert postgres_ids(tmp_path) == ["a", "b", "bad", "c", "d", "new"]
+    assert (s["archive"]["totals"]["verified"], s["delete"]["totals"]["would_delete"]) == (4, 4)
+
+
+def test_archive_problem_skips_the_delete_but_still_snapshots(tmp_path, fake_age):
+    rows = fixture_rows()
+    config, directory, offsite, status = daily(tmp_path, rows)
+    archive_run(config, directory)
+    rows[1]["response_json"] = '{"choices": ["changed"]}'  # Postgres changed after the archive: a conflict
+    write_rows(tmp_path, rows)
+    code, out = night(config, directory, offsite, status)
+    s = json.loads(open(status).read())
+    assert code == 4 and "== delete skipped: --archive exited 4" in out
+    assert (s["archive"]["exit"], s["archive"]["totals"]["conflict"], s["delete"]) == (4, 1, None)
+    assert postgres_ids(tmp_path) == ["a", "b", "bad", "c", "d", "new"]
+    assert s["snapshot"]["verified_rows"] == 3  # the conflict row lost its verified_at
+
+
+def test_archive_out_of_space_exits_3_and_deletes_nothing(tmp_path, fake_age, monkeypatch):
+    config, directory, offsite, status = daily(tmp_path)
+    monkeypatch.setattr(ta, "run_delete", lambda *a, **k: pytest.fail("--delete must not run"))
+    out = io.StringIO()
+    code = tr.run(config, directory, offsite_dir=offsite, recipient=RECIPIENT, status_path=status, min_free_gb=1e9,
+                  now=NOW, out=out)
+    s = json.loads(open(status).read())
+    assert code == 3 and s["archive"]["exit"] == 3 and s["delete"] is None
+    assert s["snapshot"] == {"error": "RuntimeError"}  # no room for the snapshot either; 3 still wins
+    assert postgres_ids(tmp_path) == ["a", "b", "bad", "c", "d", "new"]
+
+
+def test_vacuum_warning_exits_4_after_the_deletes_and_snapshots(tmp_path, fake_age):
+    config, directory, offsite, status = daily(tmp_path)
+    fixtures = json.loads((tmp_path / "letta.json").read_text())
+    (tmp_path / "letta.json").write_text(json.dumps({**fixtures, "__vacuum_warning": True}))
+    code, _ = night(config, directory, offsite, status)
+    s = json.loads(open(status).read())
+    assert code == 4 and (s["delete"]["exit"], s["delete"]["totals"]["vacuum"]) == (4, "warning")
+    assert postgres_ids(tmp_path) == ["bad", "new"]
+    assert s["snapshot"]["verified_rows"] == 4
+
+
+def test_error_mid_run_still_snapshots_and_records_only_its_class(tmp_path, fake_age, monkeypatch):
+    config, directory, offsite, status = daily(tmp_path)
+
+    def boom(*a, **k):
+        raise RuntimeError("detail that must not be printed")
+
+    monkeypatch.setattr(ta, "run_delete", boom)
+    out = io.StringIO()
+    with pytest.raises(RuntimeError):
+        tr.run(config, directory, offsite_dir=offsite, recipient=RECIPIENT, status_path=status, min_free_gb=0, now=NOW,
+               out=out)
+    s = json.loads(open(status).read())
+    assert (s["error"], s["exit"], s["delete"]) == ("RuntimeError", 1, None)
+    assert s["snapshot"]["verified_rows"] == 4 and "detail" not in out.getvalue() + open(status).read()
+
+
+def test_main_prints_the_class_and_writes_the_traceback_to_a_private_file(tmp_path, fake_age, monkeypatch, capsys):
+    config, directory, offsite, status = daily(tmp_path)
+    config_file = tmp_path / "observatory.env"
+    config_file.write_text("".join(f"{k}={v}\n" for k, v in config.items()))
+
+    def boom(*a, **k):
+        raise ValueError("detail that must not be printed")
+
+    monkeypatch.setattr(ta, "run_archive", boom)
+    monkeypatch.setattr(sys, "argv", ["trace_retention", "--config", str(config_file), "--archive-dir", directory,
+                                      "--status", status])
+    umask = os.umask(0o022)  # main() sets its own; give the rest of the test session ours back
+    try:
+        with pytest.raises(SystemExit) as exit_:
+            tr.main()
+    finally:
+        os.umask(umask)
+    printed = capsys.readouterr()
+    assert exit_.value.code == 1 and "== failed: ValueError" in printed.out
+    assert "detail" not in printed.out + printed.err
+    log = os.path.join(directory, tr.ERROR_LOG)
+    assert "detail that must not be printed" in open(log).read() and stat.S_IMODE(os.stat(log).st_mode) == 0o600
+
+
+def test_snapshot_failure_exits_5_and_keeps_the_last_snapshot(tmp_path, fake_age, monkeypatch):
+    config, directory, offsite, status = daily(tmp_path)
+    night(config, directory, offsite, status)
+    snap = os.path.join(offsite, tr.SNAPSHOT)
+    before = sha256(snap)
+    monkeypatch.setenv("FAKE_AGE_FAIL", "1")
+    code, out = night(config, directory, offsite, status)
+    s = json.loads(open(status).read())
+    assert code == 5 and s["snapshot"] == {"error": "CalledProcessError"} and "snapshot failed" in out
+    assert sha256(snap) == before == json.loads(open(os.path.join(offsite, tr.MANIFEST)).read())["sha256"]
+    assert sorted(os.listdir(offsite)) == [tr.SNAPSHOT, tr.MANIFEST]  # no plaintext or half snapshot left
+
+
+def test_output_that_is_not_an_age_file_never_replaces_the_last_snapshot(tmp_path, fake_age, monkeypatch):
+    config, directory, offsite, status = daily(tmp_path)
+    night(config, directory, offsite, status)
+    before = sha256(os.path.join(offsite, tr.SNAPSHOT))
+    monkeypatch.setenv("FAKE_AGE_GARBAGE", "1")
+    code, _ = night(config, directory, offsite, status)
+    assert code == 5 and json.loads(open(status).read())["snapshot"] == {"error": "RuntimeError"}
+    assert sha256(os.path.join(offsite, tr.SNAPSHOT)) == before
+    assert sorted(os.listdir(offsite)) == [tr.SNAPSHOT, tr.MANIFEST]
+
+
+def test_snapshot_refuses_a_directory_open_to_others(tmp_path, fake_age):
+    config, directory, offsite, status = daily(tmp_path)
+    os.chmod(offsite, 0o755)
+    code, _ = night(config, directory, offsite, status)
+    assert code == 5 and os.listdir(offsite) == []
+    assert postgres_ids(tmp_path) == ["bad", "new"]  # the deletes stand
+
+
+def test_snapshot_refuses_while_another_run_holds_the_archive_lock(tmp_path, fake_age):
+    config, directory, offsite, status = daily(tmp_path)
+    archive_run(config, directory)
+    db, _, lock = ta.open_archive(directory)  # another archive run holds the lock
+    try:
+        with pytest.raises(RuntimeError, match="lock"):
+            tr.snapshot(directory, offsite, RECIPIENT)
+    finally:
+        db.close()
+        lock.close()
+    assert os.listdir(offsite) == []
+
+
+@pytest.mark.skipif(not (shutil.which("age") and shutil.which("age-keygen")), reason="needs age and age-keygen")
+def test_real_age_snapshot_decrypts_to_the_manifest_plaintext(tmp_path):
+    config, directory, offsite, status = daily(tmp_path)
+    key = tmp_path / "key.txt"
+    subprocess.run(["age-keygen", "-o", str(key)], check=True, capture_output=True)
+    recipient = subprocess.run(["age-keygen", "-y", str(key)], check=True, capture_output=True, text=True).stdout.strip()
+    assert tr._RECIPIENT.match(recipient)
+    assert night(config, directory, offsite, status, recipient=recipient)[0] == 0
+    manifest = json.loads(open(os.path.join(offsite, tr.MANIFEST)).read())
+    plain = tmp_path / "decrypted.sqlite3"
+    subprocess.run(["age", "--decrypt", "--identity", str(key), "--output", str(plain),
+                    os.path.join(offsite, tr.SNAPSHOT)], check=True, capture_output=True)
+    assert sha256(plain) == manifest["plaintext_sha256"]
+    assert sqlite3.connect(plain).execute("select count(*) from traces where verified_at is not null").fetchone() == (4,)
+
+
+@pytest.mark.parametrize("extra", [["--offsite-dir", "x"], ["--offsite-dir", "x", "--age-recipient", "age1nope"],
+                                   ["--older-than-days", "29"]])
+def test_main_refuses_bad_arguments(tmp_path, monkeypatch, extra):
+    monkeypatch.setattr(sys, "argv", ["trace_retention", "--config", "c", "--archive-dir", str(tmp_path), *extra])
+    with pytest.raises(SystemExit) as exit_:
+        tr.main()
+    assert exit_.value.code == 2
