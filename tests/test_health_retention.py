@@ -77,3 +77,20 @@ def test_the_collector_publishes_the_check(deployment, tmp_path):
     report = json.loads((tmp_path / "telemetry" / "health.json").read_text())
     c = next(c for c in report["checks"] if c["name"] == "trace_retention_last_ok_age_h")
     assert (c["level"], c["value"], c["warn"], c["alert"]) == ("warn", 72.0, 48, None)
+
+
+def test_a_status_nested_too_deep_never_stops_the_collector(deployment, tmp_path):
+    config = config_for(deployment, tmp_path)
+    path = write_status(tmp_path / "telemetry")
+    path.write_text("[" * 100_000)
+    written = (NOW - datetime.timedelta(hours=60)).timestamp()
+    os.utime(path, (written, written))
+    assert collect.run(config, since="2026-10-01", now=NOW)[0]
+    report = json.loads((tmp_path / "telemetry" / "health.json").read_text())
+    c = next(c for c in report["checks"] if c["name"] == "trace_retention_last_ok_age_h")
+    assert (c["level"], round(c["value"])) == ("warn", 60)
+
+
+def test_an_invalid_since_falls_back_to_a_valid_start(tmp_path):
+    write_status(tmp_path, since="broken", started_at=ago(72), finished_at=ago(71.9), exit=5, dry_run=False)
+    assert health.trace_retention_age_h(str(tmp_path), NOW) == 72

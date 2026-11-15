@@ -555,3 +555,83 @@ def test_a_carried_value_that_isnt_a_timestamp_is_dropped(tmp_path, fake_age, mo
     night(config, directory, offsite, status)
     s = json.loads(open(status).read())
     assert (s["last_ok_at"], s["since"]) == (None, "2026-11-01T00:00:00+00:00")
+
+
+def real_now():
+    return datetime.datetime.now(datetime.timezone.utc)  # status files hold wall-clock times (ta._now())
+
+
+def seed(status, text, hours_old):
+    open(status, "w").write(text)
+    written = (real_now() - datetime.timedelta(hours=hours_old)).timestamp()
+    os.utime(status, (written, written))
+
+
+def retention_age(status):
+    from observatory import health
+    return health.trace_retention_age_h(os.path.dirname(status), real_now())
+
+
+def test_an_invalid_carried_since_never_restarts_the_clock_over_failed_nights(tmp_path, fake_age, monkeypatch):
+    config, directory, offsite, status = daily(tmp_path)
+    old = (real_now() - datetime.timedelta(hours=72)).isoformat()
+    seed(status, json.dumps({"since": "broken", "started_at": old, "finished_at": old, "exit": 5, "dry_run": False}), 72)
+    assert retention_age(status) >= 72
+    monkeypatch.setenv("FAKE_AGE_FAIL", "1")
+    for n in range(3):  # three failed nights in a row: still warning, from the same start
+        assert night(config, directory, offsite, status, now=NOW + datetime.timedelta(days=n))[0] == 5
+        assert retention_age(status) >= 72
+        assert tr.timestamp(json.loads(open(status).read())["since"]) == tr.timestamp(old)
+
+
+@pytest.mark.parametrize("text", ["[1, 2]", '"just a string"', "{not json", "[" * 100_000])
+def test_a_status_that_isnt_a_readable_object_keeps_its_age_over_failed_nights(tmp_path, fake_age, monkeypatch, text):
+    config, directory, offsite, status = daily(tmp_path)
+    seed(status, text, 72)
+    assert retention_age(status) >= 72
+    monkeypatch.setenv("FAKE_AGE_FAIL", "1")
+    for n in range(2):
+        assert night(config, directory, offsite, status, now=NOW + datetime.timedelta(days=n))[0] == 5
+        assert retention_age(status) >= 72
+
+
+def test_the_merge_keeps_the_newest_good_run_either_side_knows(tmp_path, fake_age):
+    config, directory, offsite, status = daily(tmp_path)
+    newer = (real_now() + datetime.timedelta(hours=2)).isoformat()  # e.g. another run's success, written first
+    seed(status, json.dumps({"since": "2026-11-01T00:00:00+00:00", "last_ok_at": newer}), 0)
+    assert night(config, directory, offsite, status)[0] == 0
+    s = json.loads(open(status).read())
+    assert s["last_ok_at"] == newer and tr.last_ok(s) == newer
+
+
+def test_a_success_published_while_another_run_writes_its_status_is_never_lost(tmp_path, fake_age, monkeypatch):
+    """Run A failed its snapshot and is publishing its status; run B succeeds and publishes in between. B's success
+    must survive: the status read, merge and write happen under one lock."""
+    import threading
+    config, directory, offsite, status = daily(tmp_path)
+    old = (real_now() - datetime.timedelta(hours=72)).isoformat()
+    seed(status, json.dumps({"since": old, "last_ok_at": old, "exit": 5, "dry_run": False}), 72)
+    bad_offsite = tmp_path / "offsite-open"
+    bad_offsite.mkdir()
+    os.chmod(bad_offsite, 0o755)  # A's snapshot refuses a directory open to others: exit 5 (chmod: umask-proof)
+    real_read, b = tr.read_status, []
+
+    def run_b():
+        b.append(night(config, directory, offsite, status, now=NOW + datetime.timedelta(minutes=1)))
+
+    def read_then_let_b_publish(path):
+        got = real_read(path)
+        if not b and threading.current_thread() is threading.main_thread():
+            worker = threading.Thread(target=run_b)
+            worker.start()
+            worker.join(timeout=5)  # without the lock, B finishes and publishes here, before A writes
+            read_then_let_b_publish.worker = worker
+        return got
+
+    monkeypatch.setattr(tr, "read_status", read_then_let_b_publish)
+    assert night(config, directory, str(bad_offsite), status)[0] == 5  # run A
+    read_then_let_b_publish.worker.join(timeout=30)
+    assert b and b[0][0] == 0  # B succeeded
+    s = json.loads(open(status).read())
+    assert s["exit"] == 0 and tr.timestamp(s["last_ok_at"]) > real_now() - datetime.timedelta(minutes=5)
+    assert retention_age(status) < 1

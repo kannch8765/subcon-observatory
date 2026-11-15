@@ -27,7 +27,7 @@ Exit codes: 0 all good; 3 --archive stopped for disk space (nothing deleted); 4 
 need a look, or the VACUUM failed or warned (see their output); 5 the snapshot failed (the deletes stand, the last
 snapshot is older); 1 an unexpected error.
 """
-import argparse, datetime, hashlib, json, os, re, shutil, sqlite3, stat, subprocess, sys, traceback, zoneinfo
+import argparse, datetime, fcntl, hashlib, json, os, re, shutil, sqlite3, stat, subprocess, sys, traceback, zoneinfo
 
 from observatory import trace_archive as ta
 from observatory.export import load_config
@@ -58,35 +58,65 @@ def _last_run(directory):
     return args, json.loads(totals) if totals else None
 
 
+def timestamp(value):
+    """An ISO timestamp as an aware datetime (naive = UTC), else None."""
+    if not isinstance(value, str):
+        return None
+    try:
+        ts = datetime.datetime.fromisoformat(value)
+    except ValueError:
+        return None
+    return ts if ts.tzinfo else ts.replace(tzinfo=datetime.timezone.utc)
+
+
 def last_ok(status):
-    """When the last real run that exited 0 finished, from a status dict; None if none is known. A real run that exited
-    0 is that run itself; otherwise its carried `last_ok_at` (status files from before that field have none)."""
+    """When the newest real run that exited 0 finished, as its ISO text, from a status dict; None if none is known.
+    Candidates: the run itself when it's a good real run, and its carried `last_ok_at` (status files from before that
+    field have none). Only real timestamps count: anything else would be copied forward forever."""
     if not isinstance(status, dict):
         return None
-    value = status.get("finished_at") if status.get("exit") == 0 and status.get("dry_run") is False \
-        else status.get("last_ok_at")
-    try:  # only a real timestamp is carried on: anything else would be copied forward forever
-        datetime.datetime.fromisoformat(value)
-    except (TypeError, ValueError):
-        return None
-    return value
+    good = status.get("exit") == 0 and status.get("dry_run") is False
+    valid = [(t, v) for v in (status.get("last_ok_at"), status.get("finished_at") if good else None)
+             if (t := timestamp(v))]
+    return max(valid)[1] if valid else None
 
 
-def _carried(status_path, status):
-    """`since` and `last_ok_at` from the last status file into this one. An unreadable file counts from when it was
-    written; a missing one makes this run the first."""
+def first_seen(status, written):
+    """Where the retention clock starts for a status: its `since`, else its `started_at` (files from before `since`),
+    else when the file was written. Only real timestamps count."""
+    return timestamp(status.get("since")) or timestamp(status.get("started_at")) or written
+
+
+def read_status(path):
+    """(status, when the file was written) for a status file; ({}, None) when there is none. Anything that isn't a
+    readable JSON object (damaged, another JSON type, nesting too deep to parse) is ({}, written): only its age is
+    known. The one reader for both this writer and the healthcheck, so neither can be stopped by a bad file."""
     try:
-        with open(status_path) as f:
-            previous = json.load(f)
-    except FileNotFoundError:
-        previous = {}
-    except (OSError, ValueError):
-        written = datetime.datetime.fromtimestamp(os.path.getmtime(status_path), datetime.timezone.utc)
-        previous = {"since": written.isoformat(timespec="seconds")}
-    previous = previous if isinstance(previous, dict) else {}
-    status["since"] = previous.get("since") or previous.get("started_at") or status["started_at"]
-    status["last_ok_at"] = last_ok(previous)
-    status["last_ok_at"] = last_ok(status)  # this run, if it is a good one
+        written = datetime.datetime.fromtimestamp(os.path.getmtime(path), datetime.timezone.utc)
+    except OSError:
+        return {}, None
+    try:
+        with open(path) as f:
+            status = json.load(f)
+    except (OSError, ValueError, RecursionError):
+        return {}, written
+    return (status, written) if isinstance(status, dict) else ({}, written)
+
+
+def _publish_status(status_path, status):
+    """Merge the clocks with the last status file and write this one, both under the status lock, so a run that read
+    an older status can never overwrite a newer one: `last_ok_at` is the newest good real run either knows of, `since`
+    the earliest start. Only a missing file makes this run the first."""
+    with open(status_path + ".lock", "a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)  # held for one read and one write
+        previous, written = read_status(status_path)
+        start = timestamp(status["started_at"])
+        before = first_seen(previous, written) if written else None
+        status["since"] = min(before, start).isoformat() if before else status["started_at"]
+        newest = [(t, v) for v in (last_ok(previous), last_ok({**status, "last_ok_at": None})) if (t := timestamp(v))]
+        status["last_ok_at"] = max(newest)[1] if newest else None
+        _write_json(status_path, status)
+        os.chmod(status_path, 0o640)  # as the collector's files in TELEMETRY_DIR
 
 
 def _sha256(path):
@@ -233,9 +263,7 @@ def run(config, directory, older_than_days=ta.DEFAULT_OLDER_THAN_DAYS, offsite_d
     status.update(finished_at=ta._now(), exit=code)
     if status_path:
         try:
-            _carried(status_path, status)
-            _write_json(status_path, status)
-            os.chmod(status_path, 0o640)  # as the collector's files in TELEMETRY_DIR
+            _publish_status(status_path, status)
         except Exception as exc:
             out.write(f"== status not written: {type(exc).__name__}\n")
             error = error or exc  # never hides an earlier error
